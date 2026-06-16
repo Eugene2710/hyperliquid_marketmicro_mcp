@@ -584,16 +584,75 @@ async def q4_rate_limit(client: httpx.AsyncClient, n: int = 30) -> None:
     print(f"  p50={median(s):.0f}ms  p90={s[int(n*0.9)]:.0f}ms  p99={s[int(n*0.99)]:.0f}ms")
 
 
-async def q5_concurrent(client: httpx.AsyncClient, wallets: list[str]) -> None:
-    print(f"\n[Q5] concurrent clearinghouseState — {len(wallets)} wallets")
-    t0 = time.perf_counter()
-    results = await asyncio.gather(*[
-        post(client, {"type": "clearinghouseState", "user": w}) for w in wallets
-    ])
-    wall = (time.perf_counter() - t0) * 1000
-    statuses = [s for _, _, s in results]
-    print(f"  wall_ms={wall:.0f}  per_req_amortized={wall/len(wallets):.0f}ms")
-    print(f"  status_codes={sorted(set(statuses))}")
+async def q5_concurrent_clearinghouse(
+    client: httpx.AsyncClient,
+    wallets: list[str],
+) -> None:
+    """Probe concurrent clearinghouseState fan-out across multiple wallets.
+
+    Tests three concurrency levels: 5, 10, and 20 parallel requests.
+    Each level uses the same wallet set, so we can compare amortized
+    per-request latency vs. concurrency level.
+    """
+    print(f"\n[Q5] concurrent clearinghouseState — fan-out test")
+    print(f"  Using {len(wallets)} wallets")
+
+    concurrency_levels = [5, 10, 20]
+
+    for n_concurrent in concurrency_levels:
+        if n_concurrent > len(wallets):
+            print(f"\n  Skipping concurrency={n_concurrent} (only {len(wallets)} wallets)")
+            continue
+
+        # Take exactly n_concurrent wallets; repeat the slice if we need more
+        # parallel requests than unique wallets, but better to have unique wallets
+        targets = wallets[:n_concurrent]
+
+        print(f"\n  --- concurrency={n_concurrent} ---")
+
+        per_request_latencies: list[float] = []
+        statuses: list[int] = []
+
+        t0 = time.perf_counter()
+        results = await asyncio.gather(*[
+            post(client, {"type": "clearinghouseState", "user": w}) for w in targets
+        ], return_exceptions=True)
+        wall_ms = (time.perf_counter() - t0) * 1000
+
+        # Process results
+        successes = 0
+        errors = 0
+        for r in results:
+            if isinstance(r, BaseException):
+                errors += 1
+                print(f"    EXCEPTION: {type(r).__name__}: {r}")
+                continue
+            data, ms, status = r
+            statuses.append(status)
+            per_request_latencies.append(ms)
+            if status == 200:
+                successes += 1
+            else:
+                errors += 1
+
+        # Stats
+        s_lat = sorted(per_request_latencies) if per_request_latencies else [0]
+        def pct(vals: list[float], p: float) -> float:
+            if not vals:
+                return 0.0
+            idx = min(int(len(vals) * p), len(vals) - 1)
+            return vals[idx]
+
+        print(f"    wall_clock={wall_ms:.0f}ms  successes={successes}  errors={errors}")
+        print(f"    per-request latency: "
+              f"min={min(s_lat):.0f}  p50={pct(s_lat, 0.5):.0f}  "
+              f"p90={pct(s_lat, 0.9):.0f}  max={max(s_lat):.0f}")
+        print(f"    amortized per request: {wall_ms / n_concurrent:.0f}ms")
+        print(f"    status_codes seen: {sorted(set(statuses))}")
+
+        # Brief pause between concurrency levels so we don't pollute each other
+        # with rate-limit residue
+        await asyncio.sleep(2.0)
 
 
 async def q6_trades_rest(client: httpx.AsyncClient) -> None:
@@ -624,13 +683,12 @@ async def q7_symbol_formats(client: httpx.AsyncClient) -> None:
 async def main() -> None:
     # Fill these from Hyperdash's current leaderboard before running.
     sample_wallet = "0xf62edeee17968d4c55d1c74936d2110333342f30" # 0xd6e56265890b76413d1d527eb9b75e334c0c5b42
-    wallet_pool = ["0x393d0b87ed38fc779fd9611144ae649ba6082109",
-                   "0x488d2a9b70cc18ef66057a48ab3d59da1c59fe08",
-                   "0x4eb8d907136189a34c9b087950211b6a566f7819",
-                   "0x05cafe987297448f21a3c7ae0ae815fddecac655",
-                   "0xe44bd27c9f10fa2f89fdb3ab4b4f0e460da29ea8",
-                   "0x0ddf9bae2af4b874b96d287a5ad42eb47138a902",
-                   ]   # 6 different leaderboard wallets
+    wallet_pool = ["0xf62edeee17968d4c55d1c74936d2110333342f30",
+                   "0xd6e56265890b76413d1d527eb9b75e334c0c5b42",
+                   "0xf62edeee17968d4c55d1c74936d2110333342f30",
+                   "0x4e4cdfeb4105c7a458f381373e21a3bc3ad78ece",
+                   "0x05904930cae1e9a48c055f4a8a83480ba7fc6abf",
+                   ]   # 5 different leaderboard wallets
 
     async with httpx.AsyncClient() as client:
         await q1_l2_aggregation(client)
@@ -639,7 +697,7 @@ async def main() -> None:
         await q2c_clearinghouse_dex_routing(client, sample_wallet)
         await q3_latency_baseline(client, n=20)
         await q3b_clock_skew_check(client)
-        await q5_concurrent(client, wallet_pool)
+        await q5_concurrent_clearinghouse(client, wallet_pool)
         await q6_trades_rest(client)
         await q7_symbol_formats(client)
         await q4_rate_limit(client, n=30)  # last — most likely to trip throttling
