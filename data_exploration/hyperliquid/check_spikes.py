@@ -82,10 +82,20 @@ import json
 import time
 from statistics import median
 from typing import Any
-
+import os
+from dotenv import load_dotenv
 import httpx
+from typing_extensions import runtime
 
+load_dotenv()
 URL = "https://api.hyperliquid.xyz/info"
+raw_wallets = os.getenv("HL_SAMPLE_WALLETS")
+wallet_pool: list[str] = [w.strip() for w in raw_wallets.split(",") if w.strip()]
+
+if not wallet_pool:
+    raise RuntimeError("No wallets provided")
+else:
+    print(f"Loaded {len(wallet_pool)} wallets from .env file")
 
 
 async def post(client: httpx.AsyncClient, payload: dict[str, Any]) -> tuple[Any, float, int]:
@@ -570,19 +580,99 @@ async def q2c_clearinghouse_dex_routing(client: httpx.AsyncClient, wallet: str) 
     print("  to add explicit dex names found in the discovery output.")
 
 
-async def q4_rate_limit(client: httpx.AsyncClient, n: int = 30) -> None:
-    print(f"\n[Q4] rate-limit probe — {n} sequential l2Book calls")
-    lats: list[float] = []
-    statuses: list[int] = []
-    for _ in range(n):
-        _, ms, st = await post(client, {"type": "l2Book", "coin": "BTC"})
-        lats.append(ms)
-        statuses.append(st)
-    bad = [s for s in statuses if s != 200]
-    print(f"  errors={len(bad)}/{n}  status_codes_seen={sorted(set(statuses))}")
-    s = sorted(lats)
-    print(f"  p50={median(s):.0f}ms  p90={s[int(n*0.9)]:.0f}ms  p99={s[int(n*0.99)]:.0f}ms")
+async def q4_rate_limit_probe_conservative(
+    client: httpx.AsyncClient,
+    rate_per_sec: float = 7.0,
+    duration_s: int = 30,
+) -> None:
+    """Sustained-load probe at 70% of the documented HL ceiling.
 
+    The HL docs state 1,200 weight/minute per IP, and l2Book has weight 2
+    per request — so the documented sustainable ceiling is 10 req/sec.
+    We run at 70% of that (7 req/sec) for 30 seconds to:
+
+    1. Verify the documented limit is at least *at* the published rate
+    2. Measure latency under sustained load (does it degrade vs. Q3?)
+    3. Confirm zero errors at our intended production rate
+
+    We do NOT push to the ceiling. Standard production discipline is to
+    operate below documented limits; this probe validates that our intended
+    operating point works, rather than measuring exactly where things break.
+    """
+    print(f"\n[Q4] sustained-rate probe — {rate_per_sec} req/sec for {duration_s}s")
+    print(f"  This is {rate_per_sec / 10.0 * 100:.0f}% of HL's documented ceiling.")
+    print(f"  Total: {int(rate_per_sec * duration_s)} requests = "
+          f"{int(rate_per_sec * duration_s * 2)} weight "
+          f"({int(rate_per_sec * duration_s * 2 / 1200 * 100)}% of 1-min budget)")
+
+    payload = {"type": "l2Book", "coin": "BTC", "nSigFigs": 5}
+    interval_s = 1.0 / rate_per_sec
+
+    statuses: list[int] = []
+    latencies: list[float] = []
+    error_details: list[tuple[int, int, str]] = []
+
+    start = time.perf_counter()
+    next_send = start
+    request_idx = 0
+
+    while (time.perf_counter() - start) < duration_s:
+        now = time.perf_counter()
+        if now < next_send:
+            await asyncio.sleep(next_send - now)
+        next_send += interval_s
+
+        request_idx += 1
+        try:
+            data, ms, status = await post(client, payload)
+            statuses.append(status)
+            latencies.append(ms)
+            if status >= 400:
+                error_details.append((request_idx, status, str(data)[:200]))
+        except Exception as e:
+            statuses.append(-1)
+            latencies.append(-1)
+            error_details.append((request_idx, -1, f"{type(e).__name__}: {e}"))
+
+        if request_idx % 50 == 0:
+            elapsed = time.perf_counter() - start
+            ok_count = sum(1 for s in statuses if s == 200)
+            print(f"  ... {request_idx} requests in {elapsed:.0f}s ({ok_count} ok)")
+
+    elapsed = time.perf_counter() - start
+    effective_rate = request_idx / elapsed
+
+    print(f"\n  --- Summary ---")
+    print(f"  total={request_idx}  elapsed={elapsed:.1f}s  "
+          f"effective_rate={effective_rate:.2f}/sec")
+
+    ok_count = sum(1 for s in statuses if s == 200)
+    err_count = len(statuses) - ok_count
+    print(f"  successes={ok_count}  errors={err_count}")
+    print(f"  status_codes_seen: {sorted(set(statuses))}")
+
+    if latencies:
+        ok_lats = sorted([l for l in latencies if l > 0])
+        if ok_lats:
+            def pct(vals: list[float], p: float) -> float:
+                idx = min(int(len(vals) * p), len(vals) - 1)
+                return vals[idx]
+            print(f"  successful-request latency under sustained load: "
+                  f"p50={pct(ok_lats, 0.5):.0f}ms  p90={pct(ok_lats, 0.9):.0f}ms  "
+                  f"p99={pct(ok_lats, 0.99):.0f}ms")
+
+    # Compare against Q3 baseline. If significantly degraded, that's a finding.
+    print(f"\n  Compare to Q3 baseline: p50=84ms, p90=204ms, p99=892ms")
+    print(f"  Degradation under sustained load (if any) tells us whether HL serves")
+    print(f"  steady traffic from cache vs. cold paths.")
+
+    if error_details:
+        print(f"\n  ⚠ Errors observed at conservative rate — investigate before scaling up.")
+        seen_statuses: set[int] = set()
+        for idx, status, body in error_details:
+            if status not in seen_statuses:
+                print(f"    req #{idx}  status={status}  body={body!r}")
+                seen_statuses.add(status)
 
 async def q5_concurrent_clearinghouse(
     client: httpx.AsyncClient,
@@ -600,9 +690,9 @@ async def q5_concurrent_clearinghouse(
     concurrency_levels = [5, 10, 20]
 
     for n_concurrent in concurrency_levels:
-        if n_concurrent > len(wallets):
-            print(f"\n  Skipping concurrency={n_concurrent} (only {len(wallets)} wallets)")
-            continue
+        # if n_concurrent > len(wallets):
+        #     print(f"\n  Skipping concurrency={n_concurrent} (only {len(wallets)} wallets)")
+        #     continue
 
         # Take exactly n_concurrent wallets; repeat the slice if we need more
         # parallel requests than unique wallets, but better to have unique wallets
@@ -682,13 +772,7 @@ async def q7_symbol_formats(client: httpx.AsyncClient) -> None:
 
 async def main() -> None:
     # Fill these from Hyperdash's current leaderboard before running.
-    sample_wallet = "0xf62edeee17968d4c55d1c74936d2110333342f30" # 0xd6e56265890b76413d1d527eb9b75e334c0c5b42
-    wallet_pool = ["0xf62edeee17968d4c55d1c74936d2110333342f30",
-                   "0xd6e56265890b76413d1d527eb9b75e334c0c5b42",
-                   "0xf62edeee17968d4c55d1c74936d2110333342f30",
-                   "0x4e4cdfeb4105c7a458f381373e21a3bc3ad78ece",
-                   "0x05904930cae1e9a48c055f4a8a83480ba7fc6abf",
-                   ]   # 5 different leaderboard wallets
+    sample_wallet: str = wallet_pool[0]
 
     async with httpx.AsyncClient() as client:
         await q1_l2_aggregation(client)
@@ -700,7 +784,7 @@ async def main() -> None:
         await q5_concurrent_clearinghouse(client, wallet_pool)
         await q6_trades_rest(client)
         await q7_symbol_formats(client)
-        await q4_rate_limit(client, n=30)  # last — most likely to trip throttling
+        await q4_rate_limit_probe_conservative(client)  # last — most likely to trip throttling
 
 
 if __name__ == "__main__":
