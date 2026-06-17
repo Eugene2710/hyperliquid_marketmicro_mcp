@@ -8,4 +8,5 @@ dependencies = [
     "asyncio>=4.0.0",
     "httpx>=0.28.1",
     "pydantic>=2.13.4",
+    "python-dotenv>=1.2.2",
 ]
