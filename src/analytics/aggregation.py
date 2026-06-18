@@ -132,4 +132,3 @@ def estimate_bucket_bps(params: L2BookParams, top_price: float) -> float:
     bucket_dollars: float = base_bucket_dollars * mantissa
 
     return (bucket_dollars / top_price) * 10_000
-
