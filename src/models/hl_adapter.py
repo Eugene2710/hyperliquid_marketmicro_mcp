@@ -15,13 +15,8 @@ from typing import Any
 
 import httpx
 
-from hl_whale_position import (
-    HLAssetPosition,
+from src.venue.hl_schemas import (
     HLClearinghouseState,
-    HLMarginSummary,
-    HLPosition,
-    CumFunding,
-    Leverage,
 )
 
 INFO_URL: str = "https://api.hyperliquid.xyz/info"
@@ -89,7 +84,16 @@ class HyperliquidPublic:
 
     Usage:
         async with HyperliquidPublic() as venue:
+            # Single wallet on native HL
             state = await venue.fetch_clearinghouse_state("0xabc...")
+
+            # Batch fan-out across wallets
+            results = await venue.fetch_clearinghouse_states_batch(
+                ["0xabc...", "0xdef..."]
+            )
+
+            # Comprehensive view across native HL + all HIP-3 dexes
+            all_dex_states = await venue.fetch_all_dexes_for_user("0xabc...")
     """
 
     def __init__(
