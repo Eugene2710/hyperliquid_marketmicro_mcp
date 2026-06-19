@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from src.venue.hl_schemas import (
+from src.models.hl_schemas import (
     HLClearinghouseState,
 )
 
