@@ -16,3 +16,6 @@ wheels/
 
 # keys and wallets
 .env
+
+# IDE
+.idea/

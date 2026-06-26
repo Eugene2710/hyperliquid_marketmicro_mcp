@@ -31,6 +31,13 @@ scope for v0.
 A commit is not "done" until `ruff check .`, `mypy --strict src/`, and
 `uv run pytest -m "not integration"` are all green.
 
+- **Broken venv recovery:** if `import hlmcp` fails (e.g. pytest can't collect
+  with `ModuleNotFoundError: No module named 'hlmcp'`) while `mypy --strict src/`
+  still passes, the `.venv` is in a half-state — the editable install is
+  registered but its `.pth` isn't on `sys.path`. Fix: `rm -rf .venv && uv sync`.
+  If a *fresh* venv still can't import, it's a real `pyproject.toml`/layout bug,
+  not corruption — stop rebuilding and look there.
+
 ## Code conventions
 
 - **Type hints are mandatory** on every function signature, every class
