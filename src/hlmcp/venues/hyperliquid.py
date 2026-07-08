@@ -14,6 +14,8 @@ What this adapter owns:
 - HTTP lifecycle: an ``httpx.AsyncClient`` it can own or borrow.
 - Rate limiting: a TokenBucket class (sustained 7 req/sec, burst 15) wrapping every request.
 - Concurrency capping: an ``asyncio.Semaphore`` (20) at ``_post``.
+- Retry: a ``tenacity`` ``@retry`` on ``_post`` replays only transient failures
+  (timeouts, transport errors, 5xx) with backoff + jitter; 4xx never retried.
 - Address normalization: every wallet is run through
   :func:`~hlmcp.analytics.utils.normalize_wallet` BEFORE sending, because HL
   silently coerces noncanonical addresses and returns an empty envelope that
@@ -32,6 +34,12 @@ from types import TracebackType
 from typing import Any
 
 import httpx
+from tenacity import (
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from hlmcp.analytics.aggregation import L2BookParams
 from hlmcp.analytics.utils import normalize_wallet
@@ -42,6 +50,37 @@ from hlmcp.venues.errors import HLAPIError
 # The empty-string dex key targets native HL perps; HL treats an omitted ``dex``
 # and ``dex: ""`` identically
 NATIVE_HL_DEX: str = ""
+
+# Retry policy for transient failures at ``_post``. HL reads are idempotent
+# (read-only info endpoint), so replaying a failed request is safe. We retry ONLY
+# retryable failures -- timeouts, connection/transport errors, and 5xx -- never
+# 4xx, which are deterministic client errors (a 422 bad-wallet retried just
+# re-fails and wastes the rate budget). The unknown-dex 500 is already prevented
+# client-side by ``_validate_dex``, so a 500 reaching ``_post`` is plausibly
+# transient. [estimate] the spike saw zero transient errors (Q4/Q5), so these are
+# a resilience margin, not tuned values.
+_MAX_ATTEMPTS: int = 3  # total attempts = the original try plus 2 retries
+_RETRY_INITIAL_WAIT_S: float = 0.25  # first backoff; then exponential with jitter
+_RETRY_MAX_WAIT_S: float = 2.0  # per-wait cap so an outage cannot amplify load
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Return whether a failed ``_post`` attempt should be retried.
+
+    Mechanism: retry HL 5xx responses (``HLAPIError`` with ``status >= 500``) and
+    ``httpx.TransportError`` (timeouts, connection/read/write errors). Everything
+    else -- notably 4xx ``HLAPIError`` (deterministic client errors) and any
+    non-HTTP exception -- is NOT retried.
+
+    Args:
+        exc: The exception raised by an attempt.
+
+    Returns:
+        ``True`` if the failure is transient and safe to replay, else ``False``.
+    """
+    if isinstance(exc, HLAPIError):
+        return exc.status >= 500
+    return isinstance(exc, httpx.TransportError)
 
 
 class TokenBucket:
@@ -191,18 +230,34 @@ class HyperliquidPublic:
         if self._owns_http_client:  # self._owns_http_client is a boolean flag
             await self._http.aclose()
 
+    @retry(
+        retry=retry_if_exception(_is_retryable),
+        stop=stop_after_attempt(_MAX_ATTEMPTS),
+        wait=wait_exponential_jitter(initial=_RETRY_INITIAL_WAIT_S, max=_RETRY_MAX_WAIT_S),
+        reraise=True,
+    )
     async def _post(self, payload: dict[str, Any]) -> Any:
         """
-        POST ``payload`` to the info endpoint, rate limited and concurrency capped.
+        POST ``payload`` to the info endpoint, rate limited, concurrency capped, retried.
 
         Every request, direct or fanned out, funnels through here, so the rate
-        limiter and semaphore apply uniformly. A token is acquired first (which
-        may wait), then the semaphore is held only for the duration of the actual
-        network call so the in-flight count never exceeds ``max_concurrency``.
+        limiter, semaphore, and retry policy apply uniformly. A token is acquired
+        first (which may wait), then the semaphore is held only for the duration
+        of the actual network call so the in-flight count never exceeds
+        ``max_concurrency``.
 
-        Mechanism: ``await rate_limiter.acquire()`` -> ``async with semaphore`` ->
-        ``http.post`` -> raise on non-2xx (body kept as a plain string) -> return
-        decoded JSON.
+        Retries are handled by a ``tenacity`` ``@retry`` wrapper on this method,
+        so each attempt re-runs the FULL body -- re-acquiring a rate-limit token
+        and re-entering the semaphore -- which keeps a retry storm within the rate
+        budget. Only ``_is_retryable`` failures (timeouts, transport errors, 5xx)
+        are retried, up to ``_MAX_ATTEMPTS`` with exponential backoff + jitter;
+        4xx and other exceptions propagate on the first attempt. ``reraise=True``
+        means the ORIGINAL exception (e.g. an ``HLAPIError`` with its status/body)
+        surfaces on exhaustion, not a tenacity ``RetryError``.
+
+        Mechanism: (per attempt) ``await rate_limiter.acquire()`` -> ``async with
+        semaphore`` -> ``http.post`` -> raise on non-2xx (body kept as a plain
+        string) -> return decoded JSON.
 
         Args:
             payload: JSON request body (e.g.
@@ -214,8 +269,9 @@ class HyperliquidPublic:
 
         Returns: Decoded JSON response (a ``dict`` or ``list`` depending on the endpoint).
 
-        Raise: HLAPIError: On any 4xx/5xx response, carrying the status, the raw
-        plain-string body, and the request payload. The body is NOT JSON-parsed.
+        Raise: HLAPIError: On any 4xx/5xx response (5xx only after retries are
+        exhausted), carrying the status, the raw plain-string body, and the
+        request payload. The body is NOT JSON-parsed.
         """
         await self._rate_limitter.acquire()
         async with self._semaphore:
