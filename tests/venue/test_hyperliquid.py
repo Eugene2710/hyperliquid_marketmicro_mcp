@@ -25,7 +25,13 @@ import respx
 from hlmcp.config import HLConfig
 from hlmcp.schemas.hl_api import HLClearinghouseState, HLL2Book, HLPerpDexs
 from hlmcp.venues.errors import HLAPIError
-from hlmcp.venues.hyperliquid import NATIVE_HL_DEX, HyperliquidPublic, TokenBucket
+from hlmcp.venues.hyperliquid import (
+    _MAX_ATTEMPTS,
+    NATIVE_HL_DEX,
+    HyperliquidPublic,
+    TokenBucket,
+    _is_retryable,
+)
 
 BASE_URL: str = "https://api.hyperliquid.xyz/info"
 
@@ -416,3 +422,74 @@ async def test_aclose_leaves_borrowed_client_open() -> None:
     await venue.aclose()
     assert not client.is_closed
     await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# Retry policy: transient failures replayed, deterministic 4xx not (tenacity)  #
+# --------------------------------------------------------------------------- #
+
+
+def test_is_retryable_classification() -> None:
+    """5xx and transport errors are retryable; 4xx and non-HTTP errors are not."""
+    assert _is_retryable(HLAPIError(500, "", {})) is True
+    assert _is_retryable(HLAPIError(503, "", {})) is True
+    assert _is_retryable(HLAPIError(422, "", {})) is False
+    assert _is_retryable(HLAPIError(400, "", {})) is False
+    assert _is_retryable(httpx.ConnectTimeout("timeout")) is True
+    assert _is_retryable(httpx.ReadError("read failed")) is True
+    assert _is_retryable(ValueError("not an HTTP error")) is False
+
+
+async def test_post_retries_5xx_then_succeeds(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """A transient 5xx is retried and the subsequent success is returned."""
+    book: Any = load_json("l2book_btc_nsf5.json")
+    calls: dict[str, int] = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, text="temporarily unavailable")
+        return httpx.Response(200, json=book)
+
+    respx_mock.post(BASE_URL).mock(side_effect=handler)
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        result = await venue.fetch_l2_book("BTC")
+
+    assert calls["n"] == 2  # one failure + one retried success
+    assert isinstance(result, HLL2Book)
+
+
+async def test_post_does_not_retry_4xx(respx_mock: respx.MockRouter) -> None:
+    """A 422 is deterministic: it raises on the first attempt with no retry."""
+    calls: dict[str, int] = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(422, text="bad request")
+
+    respx_mock.post(BASE_URL).mock(side_effect=handler)
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        with pytest.raises(HLAPIError) as excinfo:
+            await venue.fetch_l2_book("BTC")
+
+    assert excinfo.value.status == 422
+    assert calls["n"] == 1  # no retry on a 4xx
+
+
+async def test_post_exhausts_retries_then_raises_5xx(respx_mock: respx.MockRouter) -> None:
+    """A persistent 5xx is retried up to the attempt cap, then the HLAPIError surfaces."""
+    calls: dict[str, int] = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(500, text="")
+
+    respx_mock.post(BASE_URL).mock(side_effect=handler)
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        with pytest.raises(HLAPIError) as excinfo:
+            await venue.fetch_l2_book("BTC")
+
+    assert excinfo.value.status == 500  # original error reraised, not a RetryError
+    assert calls["n"] == _MAX_ATTEMPTS
