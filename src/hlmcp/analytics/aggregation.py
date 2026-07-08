@@ -31,6 +31,9 @@ This module is PURE: no I/O, no async, no network (CLAUDE.md hard rule).
 import math
 from typing import Literal, TypedDict
 
+from hlmcp.analytics.utils import parse_float
+from hlmcp.schemas.hl_api import HLL2Book
+
 
 class L2BookParams(TypedDict, total=False):
     """REST-API-shaped parameters for an ``l2Book`` request, minus ``type``/``coin``.
@@ -76,27 +79,59 @@ _BTC_AGGREGATION_LADDER: list[tuple[float, L2BookParams]] = [
 ]
 
 
-def choose_aggregation(max_band_bps: float) -> L2BookParams:
+# The full set of VALID aggregation settings, finest -> coarsest, used by the
+# price-aware selection path. Unlike ``_BTC_AGGREGATION_LADDER`` (which hardcodes
+# BTC-shaped bps ranges), this list carries only the settings; the bps range each
+# one yields is computed from the actual price via ``estimate_bucket_bps``. Note
+# the finest entry is bare ``nSigFigs=5`` (the 1x base, == the null default);
+# ``mantissa=1`` is never included because it returns HTTP 500 (Q1).
+_PRICE_AWARE_CANDIDATES: list[L2BookParams] = [
+    {"nSigFigs": 5},  # 1x base bucket
+    {"nSigFigs": 5, "mantissa": 2},  # 2x
+    {"nSigFigs": 5, "mantissa": 5},  # 5x
+    {"nSigFigs": 4},  # 10x
+    {"nSigFigs": 3},  # 100x
+    {"nSigFigs": 2},  # 1000x
+]
+
+# The l2Book 20-level cap: the total price range a setting spans is ~20 buckets.
+_L2_LEVELS_PER_SIDE: int = 20
+
+
+def choose_aggregation(max_band_bps: float, price: float | None = None) -> L2BookParams:
     """Pick ``l2Book`` API parameters so the 20-level response covers ``max_band_bps``.
 
     The endpoint returns at most 20 levels per side; their total price range
-    depends on ``nSigFigs``/``mantissa``. This returns the *highest-precision*
-    setting whose 20-level range still spans at least ``max_band_bps`` from the
-    mid price, so a tool computing imbalance at several bands (e.g. 10/25/50/100
-    bps) gets data that reaches the deepest band without wasting precision near
-    the spread.
+    depends on ``nSigFigs``/``mantissa`` AND on the coin's price magnitude
+    (``nSigFigs`` rounds by significant figures, so a given setting is far
+    coarser in bps on a $1 coin than on BTC). This returns the *highest-precision*
+    setting whose 20-level range still spans at least ``max_band_bps`` from mid.
 
-    Mechanism: walk ``_BTC_AGGREGATION_LADDER`` ascending by range and return the
-    first (finest) entry whose covered range is >= ``max_band_bps``; clamp to
-    ``nSigFigs=2`` for any band beyond the ladder.
+    Two modes:
 
-    Calibration note: the ladder is BTC-shaped. ``nSigFigs`` rounds by
-    significant figures, so the bps-per-bucket ratio shifts with price
-    magnitude; coins very different from BTC's price need a per-coin probe.
+    - **Price-aware (``price`` given, preferred).** Walks the valid settings
+      finest -> coarsest and returns the first whose reach
+      (``20 * estimate_bucket_bps(setting, price)``) is >= ``max_band_bps``. This
+      is correct for ANY coin — e.g. XRP @ ~$1.12 gets ``nSigFigs=4`` for a
+      100 bps band (~8.9 bps buckets), where the BTC ladder wrongly picks
+      ``nSigFigs=3`` (~89 bps buckets, band collapses into one bucket).
+
+    - **BTC-ladder fallback (``price`` is ``None``).** Walks the hardcoded,
+      BTC-calibrated ``_BTC_AGGREGATION_LADDER``. Retained for back-compat and
+      for coins with no available mid (the tool probes ``allMids`` and passes the
+      result; a missing coin falls back here). Only accurate near BTC's price.
+
+    Mechanism: validate ``max_band_bps > 0``; if ``price`` is given (and > 0),
+    scan ``_PRICE_AWARE_CANDIDATES`` and return the first whose computed reach
+    covers the band; otherwise scan the BTC ladder. Either path clamps to
+    ``nSigFigs=2`` for a band beyond the coarsest rung.
 
     Args:
         max_band_bps: The deepest basis-point band the caller intends to compute
             against the returned book. Must be > 0.
+        price: The coin's current mid price, used to compute each setting's true
+            bps reach. If ``None``, the BTC-calibrated ladder is used instead.
+            Must be > 0 when provided.
 
     Returns:
         An :class:`L2BookParams` dict to spread into the request payload. Never
@@ -104,20 +139,31 @@ def choose_aggregation(max_band_bps: float) -> L2BookParams:
         beyond the ladder.
 
     Raises:
-        ValueError: If ``max_band_bps`` is not strictly positive.
+        ValueError: If ``max_band_bps`` is not strictly positive, or ``price`` is
+            provided but not strictly positive.
 
     Examples:
-        >>> choose_aggregation(10.0)
-        {'nSigFigs': 5, 'mantissa': 5}
-        >>> choose_aggregation(100.0)
+        >>> choose_aggregation(100.0)  # BTC-ladder fallback
         {'nSigFigs': 3}
+        >>> choose_aggregation(100.0, price=1.12)  # price-aware (XRP-magnitude)
+        {'nSigFigs': 4}
     """
     if max_band_bps <= 0:
         raise ValueError(f"max_band_bps must be > 0, got {max_band_bps}")
 
-    for range_bps, params in _BTC_AGGREGATION_LADDER:
+    if price is not None:
+        if price <= 0:
+            raise ValueError(f"price must be > 0 when provided, got {price}")
+        for params in _PRICE_AWARE_CANDIDATES:
+            reach_bps: float = _L2_LEVELS_PER_SIDE * estimate_bucket_bps(params, price)
+            if reach_bps >= max_band_bps:
+                return params
+        # Band exceeds even the coarsest setting's reach; clamp to it.
+        return {"nSigFigs": 2}
+
+    for range_bps, ladder_params in _BTC_AGGREGATION_LADDER:
         if range_bps >= max_band_bps:
-            return params
+            return ladder_params
 
     # Band exceeds the widest ladder rung; clamp to the coarsest setting.
     return {"nSigFigs": 2}
@@ -170,3 +216,69 @@ def estimate_bucket_bps(params: L2BookParams, top_price: float) -> float:
     bucket_dollars: float = base_bucket_dollars * mantissa
 
     return (bucket_dollars / top_price) * 10_000
+
+
+def measure_bucket_width_usd(book: HLL2Book) -> float | None:
+    """Measure the ACTUAL per-bucket width in USD from a returned book.
+
+    The measured counterpart to :func:`estimate_bucket_bps`: where the estimate
+    is a plan-time guess from significant-figure arithmetic, this reads the width
+    the API actually delivered. Q1 is explicit that "tools should report the
+    actual bucket width achieved" -- the response is the source of truth, because
+    the exact dollar step is price-dependent and only approximated by the estimate.
+
+    Mechanism: the API buckets prices at a fixed increment ``S`` (empirically
+    uniform across a whole book, even when it crosses a power-of-ten boundary --
+    verified live on XRP spanning $1.12 -> $0.93 with a constant $0.01 step). So
+    every level price lies on the ``S``-grid and each consecutive gap is an
+    integer multiple of ``S`` (an empty bucket -- no resting orders in that
+    increment -- is omitted, producing a 2S+ gap; observed live). The *smallest*
+    consecutive gap across both sides is therefore ``S`` exactly, as soon as any
+    two adjacent buckets are both populated (near-certain among ~20 dense levels
+    at the spread). Taking the min -- rather than differencing just the top two --
+    is robust to those empty-bucket gaps at the same cost.
+
+    Args:
+        book: A parsed :class:`~hlmcp.schemas.hl_api.HLL2Book` from the venue.
+
+    Returns:
+        The bucket width ``S`` in USD, or ``None`` if it cannot be measured (no
+        side has two levels to difference).
+    """
+    gaps: list[float] = []
+    for side in book.levels:
+        prices: list[float] = [parse_float(level.px) for level in side]
+        gaps.extend(abs(prices[i] - prices[i + 1]) for i in range(len(prices) - 1))
+
+    # Guard against a degenerate duplicate-price pair (0.0 gap) poisoning the min;
+    # aggregated levels are strictly monotonic per side, so this is defensive.
+    positive_gaps: list[float] = [gap for gap in gaps if gap > 0.0]
+    if not positive_gaps:
+        return None
+    return min(positive_gaps)
+
+
+def bucket_width_to_bps(width_usd: float | None, mid_price: float) -> float | None:
+    """Express a USD bucket width in basis points of the mid price.
+
+    The bps view is the price-independent way to compare resolution across coins
+    (a $10 bucket is coarse on a $60 coin, fine on BTC). Pairs with
+    :func:`measure_bucket_width_usd` to yield the achieved resolution in both
+    units for the response layer.
+
+    Mechanism: ``(width_usd / mid_price) * 10_000``; short-circuits to ``None``
+    when the width is unmeasurable (``None``) or ``mid_price`` is not positive.
+
+    Args:
+        width_usd: A bucket width in USD (e.g. from
+            :func:`measure_bucket_width_usd`), or ``None`` if not measurable.
+        mid_price: The reference mid price to convert against. Must be > 0 for a
+            meaningful result.
+
+    Returns:
+        The width in basis points, or ``None`` if ``width_usd`` is ``None`` or
+        ``mid_price`` is not positive.
+    """
+    if width_usd is None or mid_price <= 0:
+        return None
+    return (width_usd / mid_price) * 10_000.0
