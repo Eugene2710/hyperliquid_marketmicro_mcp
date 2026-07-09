@@ -146,12 +146,33 @@ revisits them deliberately rather than treating them as settled.
   15) and tune against observed usage. Could reasonably be 10 or 20.
   **Confidence: low. Revisit once tools are live and burst patterns are visible.**
 
-- **The aggregation ladder is BTC-calibrated and may not generalize across
-  coins.** `nSigFigs` rounds by significant figures of the price, so the
-  bps-per-bucket relationship shifts with price magnitude. A $0.50 coin and a
-  $64k coin behave very differently at the same setting. v0 ships the BTC ladder
-  as the default; per-coin overrides or a runtime probe are the likely fix.
-  **Confidence: low. Revisit when adding non-BTC-magnitude coins.**
+- **Retry attempt count and backoff are engineering estimates, not measured. 
+  Step 4 added a tenacity retry at the venue's _post, retryable-only 
+  (timeouts / transport errors / 5xx; never 4xx, which are deterministic). 
+  _MAX_ATTEMPTS = 3 and the backoff (initial 0.25s, max 2.0s, exponential + jitter)
+  are module constants chosen as a resilience margin — the spike saw zero 
+  transient errors (Q4/Q5), so there is no measured failure distribution to tune 
+  against. Kept as constants (not env-tunable) for v0 simplicity. 
+  Confidence: low on the exact values; could reasonably be 2 or 5 attempts. 
+  Revisit if real usage surfaces transient-error patterns.**
+
+- **The aggregation ladder is BTC-calibrated; low-priced coins are now handled by 
+  a price-aware probe. nSigFigs rounds by significant figures, so a setting's 
+  bps-per-bucket scales as ~1/(leading digit of price) - the raw BTC ladder badly 
+  over-coarsens cheap coins (XRP @ ~$1.12 got ~89 bps buckets for a 100 bps band,
+  collapsing the band into a single estimate_bucket_bps - still covers the band; 
+  the order_book_imbalance tool feeds it a mid read from a one-shot full-precision
+  probe fetch reused when it already reaches the deepest band, else one extra fetch).
+  price=None retains the BTC ladder for back-compat and for coins with no available 
+  mid. Residual low-confidence points: (a) the mid's within-decade leading digit 
+  still drifts as price moves, so a pick can be one setting off near the granularity 
+  gaps - surfaced, not silently wrong; (b) it costs up to one extra fetch per call; 
+  (c) verified empirically that HL  keeps a uniform bucket grid across a whole book 
+  even crossing  a power-of-ten boundary (XRP $1.12→$0.93 at a constant $0.01 step),
+  so the feared "unequal buckets at a decade boundary" does not occur. 
+  Confidence: medium-high for BTC-magnitude and low-priced coins now;
+  a per-coin runtime probe / allMids-sourced price remains the fuller fix. 
+  Revisit for extreme magnitudes and HIP-3 symbols.**
 
 - **Whether `mantissa` should be exposed to users at all.** It's an internal
   detail (a 2×/5× bucket-width multiplier) that, if set wrong, produces empty
@@ -159,10 +180,14 @@ revisits them deliberately rather than treating them as settled.
   **Confidence: medium. Likely correct to keep internal.**
 
 - **Whether the 30→296 bps aggregation gap matters in practice.** The API has no
-  setting between `nSigFigs=4` (~30 bps range) and `nSigFigs=3` (~296 bps range),
-  so bands in that window get coarser buckets than ideal. We surface the actual
-  bucket width in the response and let the LLM judge. **Confidence: medium that
-  this is acceptable; unknown whether users will hit it often.**
+  setting between `nSigFigs=4` and `nSigFigs=3` 
+  (mantissa is only valid at nSigFigs=5) so bands landing in that window get 
+  coarser buckets than ideal. The gap lands where the coin's price puts it and 
+  reports the measured achieved bucket width (measure_bucket_width_usd,via 
+  min-of-consecutive-gaps — robust to omitted empty buckets), not just an 
+  estimate, so callers see the true resolution and can judge. 
+  Confidence: medium-high that surfacing the measured width is the honest 
+  treatment; unknown how often users hit the gap.**
 
 - **Whether ~500ms REST staleness is acceptable for the target users.** We
   believe yes for analysis and slow-loop decisioning, no for HFT, and we document
