@@ -1,0 +1,16 @@
+{
+  "_comment": "Default wallet set for the whale_position_monitor tool. Small on purpose (architecture.md open question: don't over-invest in curation). These are someone else's curation, not an endorsement; positions change constantly. Callers can always pass their own `wallets`. Community PRs to extend this list are welcome.",
+  "provenance": {
+    "source": "Hyperdash public leaderboard (hyperdash.info), top addresses by PnL.",
+    "captured": "Pre-build API spike; see data_exploration/hyperliquid/check_spikes.py ('Top 6 addresses by PnL, at point of extraction').",
+    "note": "A point-in-time snapshot of leaderboard rank, not a live or maintained ranking. Rank/positions may have changed since capture."
+  },
+  "wallets": [
+    { "address": "0x393d0b87ed38fc779fd9611144ae649ba6082109", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x488d2a9b70cc18ef66057a48ab3d59da1c59fe08", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x4eb8d907136189a34c9b087950211b6a566f7819", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x05cafe987297448f21a3c7ae0ae815fddecac655", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0xe44bd27c9f10fa2f89fdb3ab4b4f0e460da29ea8", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x0ddf9bae2af4b874b96d287a5ad42eb47138a902", "label": "HL leaderboard top-PnL (spike capture)" }
+  ]
+}
