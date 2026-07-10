@@ -19,6 +19,7 @@ Pydantic v2 (``model_validate``/``model_dump``); no I/O here.
 from pydantic import BaseModel, Field
 
 from hlmcp.analytics.imbalance import ImbalanceBand
+from hlmcp.analytics.positions import AccountRisk, PositionAggregate, PositionSummary
 
 
 class FreshnessMeta(BaseModel):
@@ -131,3 +132,140 @@ class OrderBookImbalanceResponse(BaseModel):
         description="Per-band depth-weighted imbalance, in request order."
     )
     freshness: FreshnessMeta = Field(description="Data-age metadata for this response.")
+
+
+class WhaleWalletReport(BaseModel):
+    """One wallet's positions and account-level risk on one dex.
+
+    The unit of the ``whale_position_monitor`` result: a single (wallet, dex)
+    snapshot that HAD at least one open position. ``account_risk`` is the headline
+    (see :class:`~hlmcp.analytics.positions.AccountRisk`) — for cross-margin
+    accounts the meaningful liquidation trigger is account-level, NOT the
+    per-position ``liquidation_px`` carried on each :class:`PositionSummary`
+    (api_spike_findings.md Q2).
+
+    Attributes:
+        wallet: The (normalized) wallet address this report is for.
+        dex: The dex this snapshot is from — ``""`` for native HL perps, else a
+            HIP-3 deployment name (e.g. ``"xyz"``).
+        account_risk: Account-level liquidation risk — the headline metric.
+        aggregate: Directional exposure aggregate across this wallet's positions.
+        positions: Per-position summaries, in the API's ``assetPositions`` order.
+        freshness: Data-age metadata for THIS wallet's snapshot (each wallet has
+            its own server timestamp).
+    """
+
+    wallet: str = Field(description="Normalized wallet address this report is for.")
+    dex: str = Field(description="Dex name; '' for native HL, else a HIP-3 deployment.")
+    account_risk: AccountRisk = Field(description="Account-level liquidation risk (headline).")
+    aggregate: PositionAggregate = Field(description="Directional exposure aggregate.")
+    positions: list[PositionSummary] = Field(
+        description="Per-position summaries, in assetPositions order."
+    )
+    freshness: FreshnessMeta = Field(description="Data-age metadata for this wallet's snapshot.")
+
+
+class WhalePositionFailure(BaseModel):
+    """A per-wallet (or per-dex) failure surfaced instead of aborting the whole call.
+
+    The fan-out returns errors as values (api_spike_findings.md Q5 / venue
+    ``fetch_*_batch``), so one bad wallet or a single dex's API error becomes an
+    entry here rather than failing every other wallet. Covers malformed addresses
+    (rejected client-side), API errors, and timeouts.
+
+    Attributes:
+        wallet: The wallet the failure is associated with (raw input form for a
+            rejected address; normalized otherwise).
+        dex: The dex the failure occurred on — ``""`` for native HL or when the
+            failure is not dex-specific (e.g. a malformed address).
+        error: Human-readable error description (exception type + message).
+    """
+
+    wallet: str = Field(description="Wallet the failure is associated with.")
+    dex: str = Field(description="Dex the failure occurred on; '' if native HL / not dex-specific.")
+    error: str = Field(description="Human-readable error (exception type + message).")
+
+
+class WhalePositionMonitorResponse(BaseModel):
+    """Result of the ``whale_position_monitor`` tool across a set of wallets.
+
+    Reports are emitted only for (wallet, dex) snapshots that HAD at least one
+    open position, sorted by gross notional descending (biggest exposure first).
+    A queried wallet that is absent from both ``reports`` and ``failures`` simply
+    had no open positions (a normal result, not an error). Partial failures live
+    in ``failures`` so one bad wallet never sinks the whole call.
+
+    Attributes:
+        reports: Per-(wallet, dex) reports with positions, sorted by gross
+            notional descending.
+        failures: Per-wallet/-dex failures (malformed address, API error, timeout).
+        n_wallets_queried: How many wallets were queried (after de-duplication of
+            the input).
+        include_hip3: Whether the query fanned out across HIP-3 dexes (else native
+            HL only).
+        freshness: Worst-case (oldest-snapshot) data-age across all reports; if
+            there are no reports it reflects the fetch time (staleness 0).
+    """
+
+    reports: list[WhaleWalletReport] = Field(
+        description="Per-(wallet, dex) reports with positions, sorted by gross notional desc."
+    )
+    failures: list[WhalePositionFailure] = Field(
+        description="Per-wallet/-dex failures; partial failure does not sink the call."
+    )
+    n_wallets_queried: int = Field(ge=0, description="Number of wallets queried (de-duplicated).")
+    include_hip3: bool = Field(description="Whether HIP-3 dexes were included in the fan-out.")
+    freshness: FreshnessMeta = Field(
+        description="Worst-case (oldest-snapshot) data age across reports."
+    )
+
+
+class DexInfo(BaseModel):
+    """Metadata for one HIP-3 deployment from ``perpDexs`` discovery.
+
+    Surfaces the load-bearing routing key (:attr:`name`, used as the ``dex`` field
+    for ``clearinghouseState``/``whale_position_monitor``) alongside human-facing
+    metadata and the deployment's asset universe.
+
+    Attributes:
+        name: Dex routing key (e.g. ``"xyz"``); pass as ``dex`` to other tools.
+        full_name: Human-readable name (e.g. ``"Felix Exchange"``), or ``None``.
+        deployer: Deployer wallet address, or ``None``.
+        oracle_updater: Address authorized to push oracle updates, or ``None``.
+        fee_recipient: Address receiving the deployment's fees, or ``None``.
+        n_assets: Number of markets on this dex (from ``assetToStreamingOiCap``).
+        assets: The dex's market symbols (e.g. ``["xyz:AAPL", ...]``), in API order.
+    """
+
+    name: str = Field(description="Dex routing key, e.g. 'xyz'; pass as the `dex` field.")
+    full_name: str | None = Field(default=None, description="Human-readable dex name.")
+    deployer: str | None = Field(default=None, description="Deployer wallet address.")
+    oracle_updater: str | None = Field(default=None, description="Oracle-updater address.")
+    fee_recipient: str | None = Field(default=None, description="Fee-recipient address.")
+    n_assets: int = Field(ge=0, description="Number of markets on this dex.")
+    assets: list[str] = Field(description="The dex's market symbols, in API order.")
+
+
+class ListHip3DexesResponse(BaseModel):
+    """Result of the ``list_hip3_dexes`` tool: the HIP-3 deployment catalog.
+
+    Native HL (the null-first / empty-string dex) is intentionally excluded — this
+    lists only the named HIP-3 deployments a caller can route to.
+
+    Freshness note: the ``perpDexs`` response carries NO server timestamp, so
+    :attr:`freshness` reflects local fetch time only (``staleness_ms == 0`` by
+    construction). The list is cached ~5 min and changes only when a new deployer
+    comes online (api_spike_findings.md Q2c), so freshness is not a meaningful
+    signal here; it is present for response-shape uniformity.
+
+    Attributes:
+        dexes: Metadata for each named HIP-3 deployment, in API order.
+        n_dexes: Number of HIP-3 deployments returned.
+        freshness: Local fetch-time metadata (see the note above).
+    """
+
+    dexes: list[DexInfo] = Field(description="Named HIP-3 deployments, in API order.")
+    n_dexes: int = Field(ge=0, description="Number of HIP-3 deployments returned.")
+    freshness: FreshnessMeta = Field(
+        description="Local fetch-time metadata (perpDexs has no server timestamp)."
+    )
