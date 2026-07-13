@@ -18,8 +18,14 @@ from contextlib import asynccontextmanager
 from fastmcp import FastMCP
 
 from hlmcp.config import load_config
-from hlmcp.schemas.responses import OrderBookImbalanceResponse
+from hlmcp.schemas.responses import (
+    ListHip3DexesResponse,
+    OrderBookImbalanceResponse,
+    WhalePositionMonitorResponse,
+)
+from hlmcp.tools.list_hip3_dexes import compute_list_hip3_dexes
 from hlmcp.tools.order_book_imbalance import DEFAULT_BANDS_BPS, compute_order_book_imbalance
+from hlmcp.tools.whale_position_monitor import compute_whale_positions, load_curated_whales
 from hlmcp.venues.hyperliquid import HyperliquidPublic
 
 _SERVER_INSTRUCTIONS: str = (
@@ -118,6 +124,64 @@ async def order_book_imbalance(
     """
     bands: Sequence[float] = bands_bps if bands_bps else DEFAULT_BANDS_BPS
     return await compute_order_book_imbalance(_require_venue(), coin, bands)
+
+
+@mcp.tool
+async def whale_position_monitor(
+    wallets: list[str] | None = None,
+    include_hip3: bool = False,
+) -> WhalePositionMonitorResponse:
+    """Positions and account-level liquidation risk for large Hyperliquid traders.
+
+    For each wallet, fetches its perpetuals positions and reports — as the HEADLINE
+    — account-level liquidation risk: the buffer ``accountValue -
+    crossMaintenanceMarginUsed`` (how much adverse PnL the cross-margin pool can
+    absorb before force-closing). For cross-margin accounts this is the meaningful
+    trigger; per-position ``liquidation_px`` is included but is often practically
+    meaningless and should be treated as supplementary only. Also reports each
+    position and a directional-exposure aggregate (long/short split, net bias).
+
+    Reports come sorted by gross notional (biggest exposure first). A queried
+    wallet with no open positions produces no report and no failure. Bad wallets
+    or per-wallet API errors are returned in ``failures`` rather than failing the
+    whole call.
+
+    Data age: HL REST snapshots are ~500ms stale before network latency — suitable
+    for analysis and slow-loop monitoring, NOT HFT. Check ``freshness.staleness_ms``.
+
+    Args:
+        wallets: Wallet addresses to monitor (any common form). When omitted or
+            empty, a small curated set of known large traders is used (documented
+            provenance; positions change constantly — not an endorsement).
+        include_hip3: If ``True``, also query every HIP-3 deployment (slower, but a
+            complete cross-dex view). If ``False`` (default), native HL perps only.
+
+    Returns:
+        A :class:`WhalePositionMonitorResponse`: per-wallet reports (account risk +
+        positions + aggregate), any failures, and freshness.
+    """
+    targets: list[str] = wallets if wallets else load_curated_whales()
+    return await compute_whale_positions(_require_venue(), targets, include_hip3=include_hip3)
+
+
+@mcp.tool
+async def list_hip3_dexes() -> ListHip3DexesResponse:
+    """List the HIP-3 perp deployments on Hyperliquid alongside native HL.
+
+    Returns each named HIP-3 deployment's routing key (``name``, usable as the
+    ``dex`` argument elsewhere), human metadata (full name, deployer, oracle
+    updater, fee recipient), and its market universe. Native HL is intentionally
+    excluded — this catalogs only the HIP-3 deployments you can route to.
+
+    Use it to discover which ``dex`` values are valid before querying HIP-3
+    markets, or to enumerate the ecosystem's deployments and their assets.
+
+    Returns:
+        A :class:`ListHip3DexesResponse`: one entry per HIP-3 deployment, in API
+        order, plus a count and (fetch-time) freshness. Note ``perpDexs`` carries
+        no server timestamp, so freshness reflects local fetch time only.
+    """
+    return await compute_list_hip3_dexes(_require_venue())
 
 
 def main() -> None:
