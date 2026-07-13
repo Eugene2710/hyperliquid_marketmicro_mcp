@@ -29,6 +29,11 @@ extend-exclude = ["reference", "data_exploration"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
+# Line length is owned by the formatter (`ruff format` / `black`, line-length=100),
+# which keeps CODE within 100. E501 only ever flags lines the formatter cannot
+# split — long docstring/comment prose and URLs — and we don't want a hard limit
+# on prose, so it is disabled here. Everything else in the `E` group stays on.
+ignore = ["E501"]
 
 [tool.black]
 line-length = 100
