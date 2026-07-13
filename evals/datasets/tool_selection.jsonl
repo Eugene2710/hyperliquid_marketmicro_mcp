@@ -1,0 +1,5 @@
+{"id": "sel-001", "prompt": "What's the order-book imbalance on BTC right now?", "expected_tool": "order_book_imbalance", "expected_args": {"coin": "BTC"}, "notes": "Plain single-tool routing."}
+{"id": "sel-002", "prompt": "Is there buying or selling pressure on ETH within 25 bps of mid?", "expected_tool": "order_book_imbalance", "expected_args": {"coin": "ETH", "bands_bps": [25]}, "notes": "Band should be inferred from the phrasing."}
+{"id": "sel-003", "prompt": "Show me what the big whales are positioned in on Hyperliquid.", "expected_tool": "whale_position_monitor", "expected_args": {}, "notes": "No wallets given -> curated default set."}
+{"id": "sel-004", "prompt": "What is 0x393d0b87ed38fc779fd9611144ae649ba6082109 holding, including any HIP-3 markets?", "expected_tool": "whale_position_monitor", "expected_args": {"wallets": ["0x393d0b87ed38fc779fd9611144ae649ba6082109"], "include_hip3": true}, "notes": "Explicit wallet + include_hip3 from 'including HIP-3'."}
+{"id": "sel-005", "prompt": "Which HIP-3 deployments exist and what dex names can I query?", "expected_tool": "list_hip3_dexes", "expected_args": {}, "notes": "Discovery of routable dex names."}
