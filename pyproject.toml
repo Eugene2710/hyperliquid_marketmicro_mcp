@@ -1,9 +1,22 @@
+# Distribution name is the descriptive `hyperliquid-microstructure-mcp` (settled at
+# Step 6 from architecture.md's "Open questions" lean) — discoverable and unlikely
+# to collide on PyPI. The IMPORT name stays the short `hlmcp` (see the wheel target
+# below): `pip install hyperliquid-microstructure-mcp`, then `import hlmcp`.
 [project]
-name = "hlmcp"
+name = "hyperliquid-microstructure-mcp"
 version = "0.1.0"
 description = "MCP server exposing Hyperliquid market-microstructure and execution analytics to LLM agents."
 readme = "README.md"
 requires-python = ">=3.12"
+keywords = ["hyperliquid", "mcp", "market-microstructure", "trading", "hip-3", "llm-tools"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Typing :: Typed",
+]
 dependencies = [
     "httpx>=0.28.1",
     "pydantic>=2.13.4",
@@ -12,11 +25,18 @@ dependencies = [
     "tenacity>=9.1.4",
 ]
 
+# Console entry point: `hlmcp-server` runs the FastMCP server over stdio. This is
+# the command a Claude Desktop `mcpServers` config invokes (see README).
+[project.scripts]
+hlmcp-server = "hlmcp.server:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# src/ layout: the importable package is src/hlmcp, so `import hlmcp` works after install.
+# src/ layout: the importable package is src/hlmcp, so `import hlmcp` works after
+# install even though the distribution is named `hyperliquid-microstructure-mcp`.
+# hatchling includes package data (e.g. hlmcp/data/curated_whales.json) by default.
 [tool.hatch.build.targets.wheel]
 packages = ["src/hlmcp"]
 
