@@ -21,6 +21,78 @@ HL-first, analysis-and-slow-loop-decisioning grade.
 
 ## Layered design
 
+The map below shows the four layers, the shared venue, and the two external
+systems. **Every arrow points in the "depends on / calls" direction — downward —
+and nothing points back up.** That one-way flow is the whole architectural claim.
+
+```mermaid
+flowchart TD
+    client["MCP client<br/>Claude Desktop · Cursor · LangGraph"]
+    hlapi[("Hyperliquid<br/>public REST /info")]
+
+    server["server.py · FastMCP<br/>registers 3 tools · owns one shared read-only venue (lifespan)"]
+
+    subgraph L4["tools/ · thin orchestration (only layer mixing I/O + compute)"]
+        obi["order_book_imbalance"]
+        wpm["whale_position_monitor"]
+        lhd["list_hip3_dexes"]
+    end
+
+    subgraph L3["analytics/ · PURE functions (no I/O, no async)"]
+        agg["aggregation<br/>choose_aggregation"]
+        imb["imbalance<br/>compute_imbalance"]
+        pos["positions<br/>aggregate + account risk"]
+    end
+
+    subgraph L2["venues/ · read-only REST adapter"]
+        hp["HyperliquidPublic<br/>token bucket · semaphore · retry · HIP-3 discovery+cache"]
+    end
+
+    subgraph L1["schemas/ · Pydantic models (no deps on other layers)"]
+        hlraw["hl_api · raw HL* shapes"]
+        rspn["responses · user-facing + FreshnessMeta"]
+    end
+
+    client -- "stdio / MCP" --> server
+    server --> obi & wpm & lhd
+
+    obi --> agg & imb & hp
+    wpm --> pos & hp
+    lhd --> hp
+
+    hp -- "HTTP" --> hlapi
+    hp --> hlraw
+    agg & imb & pos --> hlraw
+    obi & wpm & lhd --> rspn
+```
+
+A single tool call flows through the layers like this (using
+`order_book_imbalance`; the other two follow the same shape):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as MCP client
+    participant S as server.py<br/>(tool wrapper)
+    participant T as tools/<br/>order_book_imbalance
+    participant A as analytics<br/>(pure)
+    participant V as venues/<br/>HyperliquidPublic
+    participant H as Hyperliquid REST
+
+    C->>S: order_book_imbalance(coin, bands_bps)
+    S->>T: compute_order_book_imbalance(venue, …)
+    T->>A: choose_aggregation(price, bands)
+    A-->>T: nSigFigs / mantissa
+    T->>V: fetch l2Book(coin, …)
+    V->>H: POST /info (type=l2Book)
+    H-->>V: raw levels (HLL2Book)
+    V-->>T: HLL2Book
+    T->>A: compute_imbalance(book, bands)
+    A-->>T: per-band imbalance
+    T-->>S: OrderBookImbalanceResponse + FreshnessMeta
+    S-->>C: response
+```
+
 Four layers, strict dependency direction (each depends only on layers above it
 in this list):
 
