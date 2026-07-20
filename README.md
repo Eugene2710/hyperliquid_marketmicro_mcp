@@ -23,15 +23,31 @@ Read-only, HL-first, research- and slow-loop-decisioning grade.
 
 ## Install
 
-Requires **Python ≥ 3.12**. The Hyperliquid public API needs **no auth / no API
-key** — nothing to configure to get started.
+Requires only **Python ≥ 3.12** — `venv` and `pip` ship with it, so nothing extra
+to install. The Hyperliquid public API needs **no auth / no API key**.
+
+> **Not yet published to PyPI.** Until it is, install **from source** (below). The
+> PyPI command is how end users will install *once published* — pip fetches the
+> built package directly, no clone needed.
+
+### From source (works today) — pip, no extra tools
 
 ```bash
-uv add hyperliquid-microstructure-mcp     # with uv (recommended)
-pip install hyperliquid-microstructure-mcp # or with pip
+git clone git@github.com:Eugene2710/crypto_hl_marketmicro.git
+cd crypto_hl_marketmicro
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install .                    # installs the package + its deps into .venv
+which hlmcp-server               # -> /…/crypto_hl_marketmicro/.venv/bin/hlmcp-server
 ```
 
-Either way you get the console command **`hlmcp-server`**, which runs the MCP
+### From PyPI (once published) — pip
+
+```bash
+pip install hyperliquid-microstructure-mcp
+```
+
+Either path gives you the console command **`hlmcp-server`**, which runs the MCP
 server over stdio. The distribution is `hyperliquid-microstructure-mcp`; the
 **import** name is the short `hlmcp`.
 
@@ -39,30 +55,40 @@ server over stdio. The distribution is `hyperliquid-microstructure-mcp`; the
 hlmcp-server        # starts the stdio MCP server (an MCP client talks to it)
 ```
 
+> **Have [`uv`](https://docs.astral.sh/uv/)?** It's a faster all-in-one
+> alternative to the venv+pip dance, and it's what this repo uses for development.
+> From the cloned repo: `uv sync` then `uv run hlmcp-server`. Once on PyPI:
+> `uv add hyperliquid-microstructure-mcp`. Not required — pick pip *or* uv.
+
 ## Use it in Claude Desktop
 
-Add the server to `claude_desktop_config.json` (**Settings → Developer → Edit
-Config**), then restart Claude Desktop:
+Edit `claude_desktop_config.json` (**Settings → Developer → Edit Config**), add the
+`hlmcp` entry below, then **fully quit and reopen** Claude Desktop (⌘Q — closing the
+window isn't enough) so it reloads the config.
+
+Point `command` at the **absolute path** of the `hlmcp-server` binary from your
+install above (Claude Desktop launches with a minimal PATH, so a bare name may not
+resolve — use the full path `which hlmcp-server` printed):
 
 ```json
 {
   "mcpServers": {
     "hlmcp": {
-      "command": "hlmcp-server"
+      "command": "/absolute/path/to/crypto_hl_marketmicro/.venv/bin/hlmcp-server"
     }
   }
 }
 ```
 
-If `hlmcp-server` isn't on the PATH Claude Desktop sees, use an absolute path (the
-`hlmcp-server` in your venv's `bin/`) or invoke via `uvx`:
+If you installed with `uv` instead, run it through `uv` (this also re-syncs the
+project on launch, self-healing a stale venv):
 
 ```json
 {
   "mcpServers": {
     "hlmcp": {
-      "command": "uvx",
-      "args": ["--from", "hyperliquid-microstructure-mcp", "hlmcp-server"]
+      "command": "/opt/homebrew/bin/uv",
+      "args": ["run", "--directory", "/absolute/path/to/crypto_hl_marketmicro", "hlmcp-server"]
     }
   }
 }
@@ -70,6 +96,11 @@ If `hlmcp-server` isn't on the PATH Claude Desktop sees, use an absolute path (t
 
 Then ask, e.g., *"What's the order-book imbalance on BTC?"* or *"Show me whale
 positioning on Hyperliquid."*
+
+If the server won't start, check Claude Desktop's log
+(`~/Library/Logs/Claude/mcp-server-hlmcp.log` on macOS). A `not found in the package
+registry` error means the config is using a PyPI/`uvx` form before the package is
+published — switch to an absolute-path form above.
 
 ## Tools
 
@@ -118,6 +149,63 @@ List the HIP-3 perp deployments on Hyperliquid.
   this catalogs only the HIP-3 deployments you can route to.
 - `perpDexs` carries no server timestamp, so `freshness` reflects local fetch time
   only.
+
+## Using it well
+
+You don't call these tools directly — you ask Claude (or any MCP client) in plain
+language, and it picks the tool and reasons over the structured result. The value
+compounds when you **chain the three tools into one decision** and let the freshness
+and bucket-width metadata qualify every read.
+
+Mental model:
+
+- **`whale_position_monitor`** → positioning *bias* and *liquidation-cascade risk*.
+- **`order_book_imbalance`** → near-term *buy/sell pressure* and *execution timing*.
+- **`list_hip3_dexes`** → *widen the lens* to non-native markets, then feed the `dex`
+  back into the other two.
+
+Example prompts:
+
+- *"What's the order-book imbalance on BTC at 10, 25, and 50 bps of mid — and is the
+  bucket width tight enough to trust the 10 bps reading?"*
+- *"Show the curated whales' net bias, and flag anyone whose account buffer is thin
+  relative to gross notional."*
+- *"List the HIP-3 deployments, then monitor the curated whales across all of them."*
+  (sets `include_hip3: true`)
+
+A worked workflow — *"Should I add to a BTC long right now?"*
+
+1. **Context** — *"Are the curated whales net long or short, and is anyone near
+   liquidation that could trigger a cascade?"* → `whale_position_monitor`.
+2. **Pressure** — *"Now check BTC book imbalance at 10/25/50 bps — is there real bid
+   support near touch?"* → `order_book_imbalance`.
+3. **Synthesize** — *"Given whales are net long but two are near liquidation, and
+   top-of-book is bid-heavy but the 10 bps bucket is coarse, how would you frame the
+   risk of adding here?"*
+4. **Re-check** — *"Re-run the imbalance and tell me the staleness."* Snapshots are
+   ~500ms+ stale, so refresh right before deciding and read `staleness_ms`.
+
+Tips to get the most out of it:
+
+- **Make Claude read the metadata.** An imbalance number only means something if
+  `bucket_width_bps` ≤ your tightest band and `staleness_ms` is low.
+- **Match bands to intent** — tight (5–25 bps) for execution timing, wide (50–100 bps)
+  for sentiment. Ask for several at once.
+- **Anchor risk on the account buffer**, not per-position `liquidation_px` (often
+  meaningless for cross-margin).
+- **Bring your own wallets** — the curated set is a small starter list.
+- **`include_hip3: true` only when you need completeness** — it fans out across all
+  deployments and is slower.
+
+### What *not* to use it for
+
+- **Sub-second execution or HFT.** Data is ~500ms+ stale REST, research/slow-loop
+  grade — see [Data & limits](#data--limits). Re-query and check `staleness_ms`
+  rather than trusting one snapshot as a live tick.
+- **A single-snapshot source of truth.** It's a research aid; corroborate before
+  acting on it.
+- **Order placement or anything that signs/trades.** Read-only by design — see
+  [What this *isn't*](#what-this-isnt).
 
 ## Data & limits
 
