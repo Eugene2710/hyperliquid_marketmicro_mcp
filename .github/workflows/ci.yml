@@ -1,0 +1,55 @@
+name: CI
+
+# The deterministic quality gate: a change isn't "done" until
+# `ruff check`, `mypy --strict src/`, and `pytest -m "not integration"` are green.
+# This runs that gate on every push to main and every pull request. Integration
+# tests (which hit the live Hyperliquid API) are intentionally excluded — they are
+# opt-in and belong in a separate, scheduled workflow, not the per-PR gate.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel a superseded run on the same ref (e.g. a force-push to a PR) to save minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: lint · type · test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # uv provisions the interpreter pinned by .python-version (3.12) and installs
+      # the project + dev deps exactly as locked in uv.lock.
+      - name: Sync (project + dev deps, from uv.lock)
+        run: uv sync --frozen
+
+      # Guard against the editable-install "half-state":
+      # if `import hlmcp` fails here, the failure is diagnosed plainly rather than
+      # surfacing later as opaque pytest collection errors.
+      - name: Import sanity
+        run: uv run python -c "import hlmcp"
+
+      - name: Lint (ruff)
+        run: uv run ruff check .
+
+      - name: Type-check (mypy --strict)
+        run: uv run mypy --strict src/
+
+      - name: Unit + mocked-venue tests
+        run: uv run pytest -m "not integration"
+
+      # The v0 eval harness is a skeleton; this validates the dataset format so a
+      # malformed eval case fails CI. It runs no tools and calls no model.
+      - name: Validate eval datasets
+        run: uv run python evals/run_evals.py
