@@ -82,6 +82,7 @@ dev = [
     "mypy>=2.1.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "pytest-rerunfailures>=16.4",
     "python-dotenv>=1.2.2",
     "respx>=0.23.1",
     "ruff>=0.15.18",
