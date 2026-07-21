@@ -3,7 +3,7 @@
 Evaluation harness for `hlmcp`. **v0 ships the skeleton only** — the dataset
 format, a handful of seed cases, and a runnable `run_evals.py` that loads and
 validates them. Grading/execution against a live model or venue is post-v0
-(see `docs/build_plan.md`, "What is explicitly NOT in this plan").
+(a roadmap item — see `docs/architecture.md`).
 
 It lives outside `src/` deliberately: it is tooling *about* the package, not part
 of the shipped package.
