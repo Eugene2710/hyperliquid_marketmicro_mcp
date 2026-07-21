@@ -111,9 +111,7 @@ async def test_native_two_wallets_sorted_by_gross(load_json: Callable[[str], Any
     assert gross[0] > gross[1]
     # Every report is on the native dex and carries the account-level headline.
     assert all(r.dex == "" for r in resp.reports)
-    assert resp.reports[0].account_risk.liquidation_buffer_usd == pytest.approx(
-        12440406.8187709995
-    )
+    assert resp.reports[0].account_risk.liquidation_buffer_usd == pytest.approx(12440406.8187709995)
 
 
 async def test_partial_failure_surfaced_not_fatal(load_json: Callable[[str], Any]) -> None:
@@ -200,9 +198,7 @@ async def test_include_hip3_fans_across_dexes(load_json: Callable[[str], Any]) -
     """include_hip3 fans across dexes; reports carry the dex; flat dexes are dropped."""
     whale = HLClearinghouseState.model_validate(load_json("clearinghouse_whale.json"))
     small = HLClearinghouseState.model_validate(load_json("clearinghouse_small.json"))
-    venue = _FakeVenue(
-        per_user_dexes={WALLET_A: {"": small, "xyz": whale, "flx": _flat_state()}}
-    )
+    venue = _FakeVenue(per_user_dexes={WALLET_A: {"": small, "xyz": whale, "flx": _flat_state()}})
 
     resp = await compute_whale_positions(venue, [WALLET_A], include_hip3=True)  # type: ignore[arg-type]
 

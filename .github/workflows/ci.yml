@@ -43,6 +43,11 @@ jobs:
       - name: Lint (ruff)
         run: uv run ruff check .
 
+      # ruff format and black are configured to agree (line-length 100), so this
+      # single check is sufficient — a divergence would fail here.
+      - name: Format check (ruff)
+        run: uv run ruff format --check .
+
       - name: Type-check (mypy --strict)
         run: uv run mypy --strict src/
 

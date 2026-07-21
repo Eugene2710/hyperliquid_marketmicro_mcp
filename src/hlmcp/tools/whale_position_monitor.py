@@ -160,9 +160,7 @@ def _record_result(
     """
     if isinstance(result, BaseException):
         failures.append(
-            WhalePositionFailure(
-                wallet=wallet, dex=dex, error=f"{type(result).__name__}: {result}"
-            )
+            WhalePositionFailure(wallet=wallet, dex=dex, error=f"{type(result).__name__}: {result}")
         )
         return
     report: WhaleWalletReport | None = _build_report(wallet, dex, result, fetched_at_ms)

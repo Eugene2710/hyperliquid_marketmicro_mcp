@@ -47,6 +47,7 @@ class PositionSummary(BaseModel):
         direction: ``"long"`` (``szi > 0``) or ``"short"`` (``szi < 0``).
         ...
     """
+
     coin: str = Field(description="Trading symbol, e.g. 'BTC', 'xyz:MSTR'.")
     direction: Direction = Field(description="'long' (szi>0) or 'short' (szi<0).")
     signed_size: float = Field(description="Raw signed size szi; negative = short.")
@@ -86,6 +87,7 @@ class PositionAggregate(BaseModel):
         n_short: Count of short positions (``szi < 0``).
         ...
     """
+
     n_positions: int = Field(description="Total number of open positions aggregated.")
     n_long: int = Field(ge=0, description="Count of long positions (szi>0).")
     n_short: int = Field(ge=0, description="Count of short positions (szi<0).")
@@ -94,10 +96,11 @@ class PositionAggregate(BaseModel):
     gross_notional_usd: float = Field(ge=0.0, description="Total exposure regardless of direction.")
     net_notional_usd: float = Field(description="long_notional_usd - short_notional_usd (signed).")
     net_bias: float = Field(
-        ge = -1.0,
-        le = 1.0,
-        description = "net/gross in [-1,1]; +1 all long, -1 all short, 0 balanced/flat.",
+        ge=-1.0,
+        le=1.0,
+        description="net/gross in [-1,1]; +1 all long, -1 all short, 0 balanced/flat.",
     )
+
 
 class AccountRisk(BaseModel):
     """
@@ -114,6 +117,7 @@ class AccountRisk(BaseModel):
         account_value_usd: Cross-pool account value (collateral + unrealized PnL).
         ...
     """
+
     account_value_usd: float = Field(description="Cross-pool account value, USD.")
     cross_maintenance_margin_used_usd: float = Field(
         description="Minimum margin the cross pool must maintain, USD."
@@ -157,6 +161,7 @@ def funding_yield(position: HLPosition) -> float | None:
         return None
     return parse_float(position.cumFunding.sinceOpen) / notional
 
+
 def summarize_position(position: HLPosition) -> PositionSummary:
     """
     Materialize one raw class `HLPosition` into a class `PositionSummary`.
@@ -190,10 +195,13 @@ def summarize_position(position: HLPosition) -> PositionSummary:
         leverage_type=position.leverage.type,
         max_leverage=position.maxLeverage,
         margin_used_usd=parse_float(position.marginUsed),
-        liquidation_px=parse_optional_float(position.liquidationPx), # parse_optional_float parses into Optional[float]
+        liquidation_px=parse_optional_float(
+            position.liquidationPx
+        ),  # parse_optional_float parses into Optional[float]
         funding_since_open_usd=parse_float(position.cumFunding.sinceOpen),
         funding_yield=funding_yield(position),
     )
+
 
 def aggregate_positions(positions: Sequence[HLPosition]) -> PositionAggregate:
     """
@@ -239,6 +247,7 @@ def aggregate_positions(positions: Sequence[HLPosition]) -> PositionAggregate:
         net_notional_usd=net,
         net_bias=net_bias,
     )
+
 
 def derive_account_risk(state: HLClearinghouseState) -> AccountRisk:
     """
