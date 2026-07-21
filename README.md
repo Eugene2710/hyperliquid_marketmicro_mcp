@@ -277,9 +277,8 @@ src/hlmcp/
     curated_whales.json        # default whale set (provenance documented); shipped inside the wheel
 evals/                         # eval skeleton: datasets/*.jsonl + run_evals.py (validates format; graders post-v0)
 tests/                         # unit/ (pure, mocked) · venue/ (respx-mocked HTTP) · integration/ (live HL) · fixtures/ (recorded responses)
-docs/                          # architecture.md · api_spike_findings.md · build_plan.md
+docs/                          # architecture.md · api_spike_findings.md
 data_exploration/              # pre-build API spike scripts (reference only, not imported)
-reference/                     # reviewed draft code adapted during the build (not packaged)
 ```
 
 Strict layering, dependencies flow one way: `schemas/` → `venues/` → `analytics/`
@@ -300,4 +299,4 @@ uv run python evals/run_evals.py       # validate eval datasets
 
 ## License
 
-Not yet specified. A license will be added before any public PyPI publish.
+[MIT](LICENSE) © eugeneleejunping.
