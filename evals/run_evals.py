@@ -8,8 +8,7 @@ case is malformed, so the format itself is testable and can gate CI.
 What it does NOT do yet (``TODO(post-v0)``): actually invoke the tools against a
 venue, call a model for tool-selection, or grade assertions. Those graders are
 stubbed with explicit ``NotImplementedError``-free no-ops so the skeleton runs
-clean. See ``docs/build_plan.md`` — v0 ships the skeleton; the graded eval is a
-roadmap item.
+clean. v0 ships the skeleton; the graded eval is a roadmap item.
 
 Usage::
 
