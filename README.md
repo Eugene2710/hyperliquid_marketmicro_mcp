@@ -1,5 +1,9 @@
 # hlmcp — Hyperliquid Microstructure & Execution MCP
 
+[![PyPI](https://img.shields.io/pypi/v/hyperliquid-microstructure-mcp)](https://pypi.org/project/hyperliquid-microstructure-mcp/)
+[![Python](https://img.shields.io/pypi/pyversions/hyperliquid-microstructure-mcp)](https://pypi.org/project/hyperliquid-microstructure-mcp/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An open-source [MCP](https://modelcontextprotocol.io) server exposing **computed
 market-microstructure and execution-analytics signals** on
 [Hyperliquid](https://hyperliquid.xyz) — native HL perps *and* HIP-3
@@ -26,39 +30,41 @@ Read-only, HL-first, research- and slow-loop-decisioning grade.
 Requires only **Python ≥ 3.12** — `venv` and `pip` ship with it, so nothing extra
 to install. The Hyperliquid public API needs **no auth / no API key**.
 
-> **Not yet published to PyPI.** Until it is, install **from source** (below). The
-> PyPI command is how end users will install *once published* — pip fetches the
-> built package directly, no clone needed.
-
-### From source (works today) — pip, no extra tools
+Install into a virtual environment from PyPI:
 
 ```bash
-git clone git@github.com:Eugene2710/crypto_hl_marketmicro.git
-cd crypto_hl_marketmicro
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
-pip install .                    # installs the package + its deps into .venv
-which hlmcp-server               # -> /…/crypto_hl_marketmicro/.venv/bin/hlmcp-server
-```
-
-### From PyPI (once published) — pip
-
-```bash
 pip install hyperliquid-microstructure-mcp
+which hlmcp-server               # -> /…/.venv/bin/hlmcp-server
 ```
 
-Either path gives you the console command **`hlmcp-server`**, which runs the MCP
-server over stdio. The distribution is `hyperliquid-microstructure-mcp`; the
-**import** name is the short `hlmcp`.
+This gives you the console command **`hlmcp-server`**, which runs the MCP server
+over stdio. The distribution is `hyperliquid-microstructure-mcp`; the **import**
+name is the short `hlmcp`.
 
 ```bash
 hlmcp-server        # starts the stdio MCP server (an MCP client talks to it)
 ```
 
-> **Have [`uv`](https://docs.astral.sh/uv/)?** It's a faster all-in-one
-> alternative to the venv+pip dance, and it's what this repo uses for development.
-> From the cloned repo: `uv sync` then `uv run hlmcp-server`. Once on PyPI:
-> `uv add hyperliquid-microstructure-mcp`. Not required — pick pip *or* uv.
+> **Have [`uv`](https://docs.astral.sh/uv/)?** It's a faster all-in-one alternative
+> to the venv+pip dance: `uv add hyperliquid-microstructure-mcp`, or run it with no
+> install at all via `uvx --from hyperliquid-microstructure-mcp hlmcp-server`. Not
+> required — pick pip *or* uv.
+
+<details>
+<summary>Install from source (for development)</summary>
+
+```bash
+git clone git@github.com:Eugene2710/crypto_hl_marketmicro.git
+cd crypto_hl_marketmicro
+uv sync                 # install the package + dev deps into .venv
+uv run hlmcp-server     # run it
+```
+
+See [Development](#development) for the test/lint/type gate.
+
+</details>
 
 ## Use it in Claude Desktop
 
@@ -66,29 +72,30 @@ Edit `claude_desktop_config.json` (**Settings → Developer → Edit Config**), 
 `hlmcp` entry below, then **fully quit and reopen** Claude Desktop (⌘Q — closing the
 window isn't enough) so it reloads the config.
 
-Point `command` at the **absolute path** of the `hlmcp-server` binary from your
-install above (Claude Desktop launches with a minimal PATH, so a bare name may not
-resolve — use the full path `which hlmcp-server` printed):
-
-```json
-{
-  "mcpServers": {
-    "hlmcp": {
-      "command": "/absolute/path/to/crypto_hl_marketmicro/.venv/bin/hlmcp-server"
-    }
-  }
-}
-```
-
-If you installed with `uv` instead, run it through `uv` (this also re-syncs the
-project on launch, self-healing a stale venv):
+The simplest option — no separate install — uses [`uv`](https://docs.astral.sh/uv/)
+to fetch and run it from PyPI on launch. Point `command` at the **absolute path** to
+`uv` (Claude Desktop launches with a minimal PATH, so a bare name may not resolve —
+`which uv` prints yours):
 
 ```json
 {
   "mcpServers": {
     "hlmcp": {
       "command": "/opt/homebrew/bin/uv",
-      "args": ["run", "--directory", "/absolute/path/to/crypto_hl_marketmicro", "hlmcp-server"]
+      "args": ["tool", "run", "--from", "hyperliquid-microstructure-mcp", "hlmcp-server"]
+    }
+  }
+}
+```
+
+If you `pip install`ed it into a venv instead, point `command` straight at that
+venv's `hlmcp-server` binary (the absolute path `which hlmcp-server` printed):
+
+```json
+{
+  "mcpServers": {
+    "hlmcp": {
+      "command": "/absolute/path/to/.venv/bin/hlmcp-server"
     }
   }
 }
@@ -98,9 +105,7 @@ Then ask, e.g., *"What's the order-book imbalance on BTC?"* or *"Show me whale
 positioning on Hyperliquid."*
 
 If the server won't start, check Claude Desktop's log
-(`~/Library/Logs/Claude/mcp-server-hlmcp.log` on macOS). A `not found in the package
-registry` error means the config is using a PyPI/`uvx` form before the package is
-published — switch to an absolute-path form above.
+(`~/Library/Logs/Claude/mcp-server-hlmcp.log` on macOS).
 
 ## Tools
 
