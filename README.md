@@ -56,8 +56,8 @@ hlmcp-server        # starts the stdio MCP server (an MCP client talks to it)
 <summary>Install from source (for development)</summary>
 
 ```bash
-git clone git@github.com:Eugene2710/crypto_hl_marketmicro.git
-cd crypto_hl_marketmicro
+git clone git@github.com:Eugene2710/hyperliquid_marketmicro_mcp.git
+cd hyperliquid_marketmicro_mcp
 uv sync                 # install the package + dev deps into .venv
 uv run hlmcp-server     # run it
 ```
