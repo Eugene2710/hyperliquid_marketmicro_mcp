@@ -205,6 +205,13 @@ class HyperliquidPublic:
         # ``None`` means "never fetched.
         self._dex_cache: HLPerpDexs | None = None
         self._dex_cache_ts: float = 0.0
+        # Single-flight guard for the cold perpDexs fetch. Without it a cold-cache
+        # concurrent fan-out (every wallet x dex validating its dex at once)
+        # stampedes the endpoint with one ``perpDexs`` POST per caller, each
+        # burning a rate-limit token and lengthening the queue. The lock lets
+        # exactly one coroutine do the cold fetch; the rest await it and then read
+        # the now-warm cache. Only contended during the cold window.
+        self._dex_cache_lock: asyncio.Lock = asyncio.Lock()
 
     async def __aenter__(self) -> "HyperliquidPublic":
         """
@@ -236,7 +243,7 @@ class HyperliquidPublic:
         wait=wait_exponential_jitter(initial=_RETRY_INITIAL_WAIT_S, max=_RETRY_MAX_WAIT_S),
         reraise=True,
     )
-    async def _post(self, payload: dict[str, Any]) -> Any:
+    async def _post(self, payload: dict[str, Any], *, timeout_s: float | None = None) -> Any:
         """
         POST ``payload`` to the info endpoint, rate limited, concurrency capped, retried.
 
@@ -245,6 +252,14 @@ class HyperliquidPublic:
         first (which may wait), then the semaphore is held only for the duration
         of the actual network call so the in-flight count never exceeds
         ``max_concurrency``.
+
+        ``timeout_s`` bounds ONLY the network call (the ``http.post``), NOT the
+        rate-limiter wait that precedes it. This is deliberate: a request that sits
+        in the token-bucket queue for seconds during a wide fan-out and then
+        completes its network round-trip in ~85ms is a SUCCESS, not a timeout.
+        Bounding the whole coroutine (the old ``asyncio.wait_for`` at the fan-out
+        layer) counted queue time against the deadline and killed the tail of any
+        fan-out wider than the burst. ``None`` uses the client's default timeout.
 
         Retries are handled by a ``tenacity`` ``@retry`` wrapper on this method,
         so each attempt re-runs the FULL body -- re-acquiring a rate-limit token
@@ -266,6 +281,9 @@ class HyperliquidPublic:
                 "user": ... ,
                 "dex": ...
             }``)
+            timeout_s: Per-request network timeout in seconds, applied to the
+            ``http.post`` only (not the preceding rate-limit wait). ``None``
+            (default) uses the client's configured timeout.
 
         Returns: Decoded JSON response (a ``dict`` or ``list`` depending on the endpoint).
 
@@ -275,7 +293,11 @@ class HyperliquidPublic:
         """
         await self._rate_limitter.acquire()
         async with self._semaphore:
-            response: httpx.Response = await self._http.post(self._config.base_url, json=payload)
+            response: httpx.Response = await self._http.post(
+                self._config.base_url,
+                json=payload,
+                timeout=(timeout_s if timeout_s is not None else httpx.USE_CLIENT_DEFAULT),
+            )
             if response.status_code >= 400:
                 # Body is a plain string (serde error / empty); do not json-parse
                 raise HLAPIError(response.status_code, response.text, payload)
@@ -297,18 +319,31 @@ class HyperliquidPublic:
 
         Raise: HLAPIError if the ``perpDexs`` request fails.
         """
-        now: float = time.monotonic()
         if (
             self._dex_cache is not None
-            and (now - self._dex_cache_ts) < self._config.dex_cache_ttl_s
+            and (time.monotonic() - self._dex_cache_ts) < self._config.dex_cache_ttl_s
         ):
             return self._dex_cache
 
-        raw: Any = await self._post({"type": "perpDexs"})
-        parsed: HLPerpDexs = HLPerpDexs.model_validate(raw)
-        self._dex_cache = parsed
-        self._dex_cache_ts = now
-        return parsed
+        # Cold or stale: serialize the refetch so a concurrent fan-out does not
+        # stampede ``perpDexs``.
+        async with self._dex_cache_lock:
+            # Re-check under the lock. The outer check and acquiring the lock are
+            # separate await points, so a coroutine that lost the race here was
+            # already past the outer check (on a then-cold cache) while the winner
+            # did the fetch; without this second check it would refetch a cache the
+            # winner already filled -- a narrowed stampede. Warm value -> return it.
+            now: float = time.monotonic()
+            if (
+                self._dex_cache is not None
+                and (now - self._dex_cache_ts) < self._config.dex_cache_ttl_s
+            ):
+                return self._dex_cache
+            raw: Any = await self._post({"type": "perpDexs"})
+            parsed: HLPerpDexs = HLPerpDexs.model_validate(raw)
+            self._dex_cache = parsed
+            self._dex_cache_ts = now
+            return parsed
 
     async def _known_dex_names(self) -> set[str]:
         """
@@ -350,7 +385,7 @@ class HyperliquidPublic:
             )
 
     async def fetch_clearinghouse_state(
-        self, user: str, dex: str = NATIVE_HL_DEX
+        self, user: str, dex: str = NATIVE_HL_DEX, *, timeout_s: float | None = None
     ) -> HLClearinghouseState:
         """
         Fetch one wallet's perpetuals account state on one dex.
@@ -363,6 +398,9 @@ class HyperliquidPublic:
             case); normalized before sending.
             dex: Dex name. "" (default) targets native HL perps; a HIP-3 name
             targets that deployment. Validated before the request.
+            timeout_s: Per-request network timeout in seconds, forwarded to
+            ``_post`` (bounds the POST only, not the rate-limit wait). ``None``
+            uses the client default.
 
         Raises:
             ValueError: IF ``user`` is not a valid address or ``dex`` is unknown
@@ -371,7 +409,9 @@ class HyperliquidPublic:
         """
         normalized: str = normalize_wallet(user)
         await self._validate_dex(dex)
-        raw: Any = await self._post({"type": "clearinghouseState", "user": normalized, "dex": dex})
+        raw: Any = await self._post(
+            {"type": "clearinghouseState", "user": normalized, "dex": dex}, timeout_s=timeout_s
+        )
         return HLClearinghouseState.model_validate(raw)
 
     async def fetch_clearinghouse_states_batch(
@@ -381,8 +421,10 @@ class HyperliquidPublic:
         Fan out ``clearinghouseState`` across many wallets on one dex.
 
         Concurrent fan-out scales cleanly; the semaphore in ``_post`` bounds
-        in-flight requests no matter how wide the fan-out. Per-wallet timeouts keep
-        one slow wallet from dragging the whole batch's wall-clock.
+        in-flight requests no matter how wide the fan-out. The per-wallet timeout
+        bounds each wallet's NETWORK call (not its wait in the rate-limiter queue),
+        so a fan-out wider than the token-bucket burst still completes -- the tail
+        wallets simply wait their turn for a token instead of being killed.
 
         Errors are returned as **values, not raised **: each wallet maps to either
         its state or the exception fetching it produced (timeout, ``HLAPIError``,
@@ -414,8 +456,8 @@ class HyperliquidPublic:
         async def fetch_one(wallet: str) -> tuple[str, HLClearinghouseState | Exception]:
             """Fetch one wallet, capturing any error as the return value."""
             try:
-                state: HLClearinghouseState = await asyncio.wait_for(
-                    self.fetch_clearinghouse_state(wallet, dex=dex), timeout=timeout_s
+                state: HLClearinghouseState = await self.fetch_clearinghouse_state(
+                    wallet, dex=dex, timeout_s=timeout_s
                 )
                 return wallet, state
             except Exception as e:
@@ -433,8 +475,11 @@ class HyperliquidPublic:
         Fetch one wallet's state across every known dex (native HL + all HIP-3).
 
         A wallet holds separate margin pools per dex, so a complete whale view
-        requires querying all of them. Some exceptions-as-values contract as
-        ``fetch_clearinghouse_states_batch``.
+        requires querying all of them. Same exceptions-as-values contract as
+        ``fetch_clearinghouse_states_batch``. The per-dex timeout bounds each dex's
+        NETWORK call, not its wait in the rate-limiter queue, so a fan-out across
+        all dexes (wider than the token-bucket burst) completes rather than timing
+        out its tail.
 
         Args:
             user: wallet address (normalized before sending).
@@ -459,8 +504,8 @@ class HyperliquidPublic:
         async def fetch_one(dex: str) -> tuple[str, HLClearinghouseState | Exception]:
             """Fetch the wallet on one dex, capturing any error as the return value."""
             try:
-                state: HLClearinghouseState = await asyncio.wait_for(
-                    self.fetch_clearinghouse_state(normalized, dex=dex), timeout=timeout_s
+                state: HLClearinghouseState = await self.fetch_clearinghouse_state(
+                    normalized, dex=dex, timeout_s=timeout_s
                 )
                 return dex, state
             except Exception as e:
