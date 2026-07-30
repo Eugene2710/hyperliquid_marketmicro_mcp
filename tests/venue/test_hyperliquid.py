@@ -313,7 +313,7 @@ async def test_semaphore_caps_in_flight_requests() -> None:
     in_flight: int = 0
     peak: int = 0
 
-    async def fake_post(url: str, json: dict[str, Any]) -> httpx.Response:
+    async def fake_post(url: str, json: dict[str, Any], timeout: Any = None) -> httpx.Response:
         nonlocal in_flight, peak
         in_flight += 1
         peak = max(peak, in_flight)
@@ -362,6 +362,60 @@ async def test_list_dexes_is_cached_within_ttl(
         await venue.list_dexes()
 
     assert sum(1 for p in seen if p["type"] == "perpDexs") == 1
+
+
+async def test_concurrent_cold_cache_single_flights_perpdexs(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """Concurrent cold-cache list_dexes calls make exactly ONE perpDexs request.
+
+    Regression for the HIP-3 fan-out stampede: before the single-flight lock, N
+    coroutines all saw an empty cache and each fired its own perpDexs POST (here
+    20), each burning a rate-limit token and lengthening the queue. The lock lets
+    one coroutine do the cold fetch while the rest await it and read the warm
+    cache, so only one request goes out.
+    """
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(perpdexs=load_json("perpdexs.json"), seen=seen)
+    )
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        await asyncio.gather(*(venue.list_dexes() for _ in range(20)))
+
+    assert sum(1 for p in seen if p["type"] == "perpDexs") == 1
+
+
+# --------------------------------------------------------------------------- #
+# Wide fan-out survives rate-limit queueing (regression for HIP-3 timeout)     #
+# --------------------------------------------------------------------------- #
+
+
+async def test_wide_fanout_survives_rate_limit_queue(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """A fan-out wider than the token-bucket burst completes -- no queue-starved timeouts.
+
+    Reproduces the reported HIP-3 failure: ``fetch_all_dexes_for_user`` fans out
+    across all 10 dexes (9 HIP-3 + native) with a small burst (2) and slow refill
+    (20/s), so most requests must wait in the token queue longer than the 0.15s
+    per-request timeout. The OLD code wrapped each wallet's whole coroutine --
+    token wait included -- in ``asyncio.wait_for``, so the tail of the fan-out died
+    as ``TimeoutError``. Now the timeout bounds only the (here instant) network
+    call, so every dex returns state and none is captured as an exception-value.
+    """
+    config = _fast_config(sustained_rate_per_sec=20.0, burst_capacity=2.0)
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(
+            perpdexs=load_json("perpdexs.json"),
+            clearinghouse=load_json("clearinghouse_small.json"),
+        )
+    )
+    async with HyperliquidPublic(config=config) as venue:
+        results = await venue.fetch_all_dexes_for_user(WALLET_A, per_request_timeout_s=0.15)
+
+    # 9 HIP-3 dexes + native HL, every one a successful parse (zero timeouts).
+    assert len(results) == 10
+    assert all(isinstance(state, HLClearinghouseState) for state in results.values())
 
 
 # --------------------------------------------------------------------------- #

@@ -1,16 +1,21 @@
 {
   "_comment": "Default wallet set for the whale_position_monitor tool. Small on purpose (architecture.md open question: don't over-invest in curation). These are someone else's curation, not an endorsement; positions change constantly. Callers can always pass their own `wallets`. Community PRs to extend this list are welcome.",
   "provenance": {
-    "source": "Hyperdash public leaderboard (hyperdash.info), top addresses by PnL.",
-    "captured": "Pre-build API spike; see data_exploration/hyperliquid/check_spikes.py ('Top 6 addresses by PnL, at point of extraction').",
+    "source": "Hyperdash public leaderboard (hyperdash.info), top 10 addresses by PnL.",
+    "captured": "Point-in-time top-10 leaderboard snapshot, seeded during the pre-build API spike (data_exploration/hyperliquid/check_spikes.py) and extended to 10; the two Abraxas Capital hedged accounts are separately labeled below.",
     "note": "A point-in-time snapshot of leaderboard rank, not a live or maintained ranking. Rank/positions may have changed since capture."
   },
   "wallets": [
-    { "address": "0x393d0b87ed38fc779fd9611144ae649ba6082109", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0x488d2a9b70cc18ef66057a48ab3d59da1c59fe08", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0x4eb8d907136189a34c9b087950211b6a566f7819", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0x05cafe987297448f21a3c7ae0ae815fddecac655", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0xe44bd27c9f10fa2f89fdb3ab4b4f0e460da29ea8", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0x0ddf9bae2af4b874b96d287a5ad42eb47138a902", "label": "HL leaderboard top-PnL (spike capture)" }
+    { "address": "0x42bc06d636e9a9a93edb1ddf781ee97821a73946", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x6a02aedceac5a6813d960e4dae1910d9c458e77c", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x99b1098d9d50aa076f78bd26ab22e6abd3710729", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0xe2f86feccb1207710a442bc4e27a0701a290275a", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0xa4add8273d7f47318675bdfbcce3e9648cdb4509", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x8c96e5a2d770f9f2c9d2464ce4e741df0b2bca57", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0xb83de012dba672c76a7dbbbf3e459cb59d7d6e36", "label": "Abraxas Capital (Hedged) 1" },
+    { "address": "0x8bae3527e5a33fa0cf184f37bc112d071463ab6d", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0xfb941d2344b72ea9101400392b818173772d0ddf", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x5b5d51203a0f9079f8aeb098a6523a13f298c060", "label": "Abraxas Capital (Hedged) 2" }
+
   ]
 }
