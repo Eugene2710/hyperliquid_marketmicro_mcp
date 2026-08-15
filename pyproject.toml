@@ -65,13 +65,19 @@ extend-exclude = "data_exploration/"
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src"]
+# evals/ is not shipped in the wheel, but it is first-party code the project's
+# "type hints mandatory" rule applies to — so it is type-checked alongside src/.
+files = ["src", "evals"]
 exclude = "data_exploration/"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 norecursedirs = ["data_exploration", ".venv", "*.egg-info"]
+# Put the repo root on sys.path so tests can `from evals.grader import ...`.
+# evals/ lives outside src/ deliberately (it is tooling *about* the package, not
+# part of the wheel), so it is not covered by the editable install.
+pythonpath = ["."]
 markers = [
     "integration: hits the live Hyperliquid API (deselect with -m 'not integration')",
 ]
