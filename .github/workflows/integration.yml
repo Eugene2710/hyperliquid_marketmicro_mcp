@@ -48,3 +48,12 @@ jobs:
       # don't raise false alarms. A genuine schema change fails all retries.
       - name: Live integration tests
         run: uv run pytest -m integration --reruns 2 --reruns-delay 5
+
+      # Grades the tool_output eval cases against live HL. No model and no API
+      # key are involved — the tools are called directly — so this adds network
+      # time but zero cost. Runs even if the tests above fail, because a tool
+      # returning wrong *values* is a separate signal from a test erroring, and
+      # we want both in one nightly report.
+      - name: Tool-output evals (live HL, no model)
+        if: always()
+        run: uv run python evals/run_evals.py --run-output
