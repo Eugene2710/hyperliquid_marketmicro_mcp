@@ -107,6 +107,35 @@ positioning on Hyperliquid."*
 If the server won't start, check Claude Desktop's log
 (`~/Library/Logs/Claude/mcp-server-hlmcp.log` on macOS).
 
+### Developing against your working copy
+
+Both configs above run an *installed* copy, so edits to `src/` won't show up. To
+point Desktop at a clone, use that repo's `.venv/bin/hlmcp-server` **and set
+`PYTHONPATH`**:
+
+```json
+{
+  "mcpServers": {
+    "hlmcp": {
+      "command": "/absolute/path/to/repo/.venv/bin/hlmcp-server",
+      "env": { "PYTHONPATH": "/absolute/path/to/repo/src" }
+    }
+  }
+}
+```
+
+The `env` block is **required on macOS**. `uv` marks the whole venv hidden, and
+CPython's `site` module deliberately skips hidden `.pth` files — so the editable
+install's path to `src/` is never read. The server exits with
+`ModuleNotFoundError: No module named 'hlmcp'` and the tools silently fail to
+appear. `PYTHONPATH` sidesteps the `.pth` entirely. (Normal installs are
+unaffected: they place `hlmcp/` directly in `site-packages`, with no `.pth`
+involved. Linux contributors won't hit this — it's a BSD-flag behaviour.)
+
+Note `PYTHONPATH` must be nested **inside** `env`; as a sibling of `command` it
+is silently ignored. Restart with ⌘Q after any config or `src/` change — closing
+the window isn't enough.
+
 ## Tools
 
 Three read-only tools. Every response carries a `freshness` object
