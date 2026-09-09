@@ -6,15 +6,15 @@
     "note": "A point-in-time snapshot of leaderboard rank, not a live or maintained ranking. Rank/positions may have changed since capture."
   },
   "wallets": [
-    { "address": "0x42bc06d636e9a9a93edb1ddf781ee97821a73946", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0x6a02aedceac5a6813d960e4dae1910d9c458e77c", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0x99b1098d9d50aa076f78bd26ab22e6abd3710729", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0xe2f86feccb1207710a442bc4e27a0701a290275a", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0xa4add8273d7f47318675bdfbcce3e9648cdb4509", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0x8c96e5a2d770f9f2c9d2464ce4e741df0b2bca57", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0xe2823659be02e0f48a4660e4da008b5e1abfdf29", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x7583b5364597736a6a72c4ba61ede0a4a37ef4de", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x04a97ae7f350a22cd0cdb6b1875e8905b76495aa", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0xab59fb979ae9042ae23bfbe5bd1eb89b7f5659b5", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0x80f2e5f37b047d875c5685a67450965417b90c3a", "label": "HL leaderboard top-PnL (spike capture)" },
+    { "address": "0xb7e0b9fbc9479330d70bcc82a7d4325a20e8d1aa", "label": "HL leaderboard top-PnL (spike capture)" },
     { "address": "0xb83de012dba672c76a7dbbbf3e459cb59d7d6e36", "label": "Abraxas Capital (Hedged) 1" },
+    { "address": "0xe09726ff25f5001f37b15049f54116cb83d7d0fe", "label": "HL leaderboard top-PnL (spike capture)" },
     { "address": "0x8bae3527e5a33fa0cf184f37bc112d071463ab6d", "label": "HL leaderboard top-PnL (spike capture)" },
-    { "address": "0xfb941d2344b72ea9101400392b818173772d0ddf", "label": "HL leaderboard top-PnL (spike capture)" },
     { "address": "0x5b5d51203a0f9079f8aeb098a6523a13f298c060", "label": "Abraxas Capital (Hedged) 2" }
 
   ]

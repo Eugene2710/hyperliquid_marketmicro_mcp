@@ -339,17 +339,11 @@ def _load_observations(path: Path) -> dict[str, Observation]:
     """
     observations: dict[str, Observation] = {}
     for lineno, row in _load_jsonl(path):
-        case_id = row.get("id")
-        if not isinstance(case_id, str) or not case_id:
-            raise ValueError(f"{path.name}:{lineno}: missing/empty string 'id'")
-        observed_tool = row.get("observed_tool")
-        observations[case_id] = Observation(
-            case_id=case_id,
-            observed_tool=None if observed_tool is None else str(observed_tool),
-            observed_args=row.get("observed_args") or {},
-            model=str(row.get("model", "unknown")),
-            notes=str(row.get("notes", "")),
-        )
+        try:
+            observation = Observation.from_row(row)
+        except ValueError as exc:
+            raise ValueError(f"{path.name}:{lineno}: {exc}") from exc
+        observations[observation.case_id] = observation
     return observations
 
 
@@ -406,10 +400,19 @@ def report_selection(results: list[SelectionCaseResult], unobserved: list[str]) 
 
     graded = len(results)
     routed = sum(1 for r in results if r.tool_ok)
+    # Multi-tool turns are surfaced as a fact, not a demerit. Extra calls may be
+    # necessary sequencing (discover dex names, then query them) or unnecessary
+    # hedging, and nothing here can tell which. This points at the cases; the
+    # notes carry the judgment. It exists so a clean routing percentage can never
+    # quietly hide that some cases behaved differently.
+    multi = [r for r in results if len(r.observed_tools) > 1]
     with_args = [r for r in results if r.args_ok is not None]
     args_ok = sum(1 for r in with_args if r.args_ok)
 
     print(f"\nrouting: {routed}/{graded} correct" + (f" ({routed / graded:.0%})" if graded else ""))
+    if multi:
+        ids = ", ".join(r.case_id for r in multi)
+        print(f"multi:   {len(multi)}/{graded} used more than one tool ({ids}) — see notes")
     if with_args:
         print(f"args:    {args_ok}/{len(with_args)} matched (soft expectation)")
     if unobserved:

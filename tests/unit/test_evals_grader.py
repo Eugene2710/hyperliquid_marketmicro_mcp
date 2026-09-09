@@ -188,14 +188,14 @@ def test_output_case_with_no_assertions_fails_rather_than_vacuously_passing() ->
 def test_selection_correct_tool() -> None:
     """The happy path: model routed to the expected tool."""
     case = {"id": "sel-001", "expected_tool": "order_book_imbalance"}
-    obs = Observation("sel-001", "order_book_imbalance")
+    obs = Observation("sel-001", ["order_book_imbalance"])
     assert grade_selection_case(case, obs).tool_ok is True
 
 
 def test_selection_wrong_tool() -> None:
     """Routing to a different tool fails and names both tools."""
     case = {"id": "sel-001", "expected_tool": "order_book_imbalance"}
-    result = grade_selection_case(case, Observation("sel-001", "whale_position_monitor"))
+    result = grade_selection_case(case, Observation("sel-001", ["whale_position_monitor"]))
     assert result.tool_ok is False
     assert "expected order_book_imbalance" in " ".join(result.detail)
 
@@ -203,7 +203,7 @@ def test_selection_wrong_tool() -> None:
 def test_selection_expected_a_tool_but_none_was_called() -> None:
     """Answering from memory instead of calling a tool is a routing failure."""
     case = {"id": "sel-001", "expected_tool": "order_book_imbalance"}
-    result = grade_selection_case(case, Observation("sel-001", None))
+    result = grade_selection_case(case, Observation("sel-001", []))
     assert result.tool_ok is False
     assert "no tool was called" in " ".join(result.detail)
 
@@ -211,7 +211,7 @@ def test_selection_expected_a_tool_but_none_was_called() -> None:
 def test_negative_case_passes_when_no_tool_is_called() -> None:
     """A negative case (expected_tool: null) is satisfied by calling nothing."""
     case = {"id": "sel-neg", "expected_tool": None}
-    assert grade_selection_case(case, Observation("sel-neg", None)).tool_ok is True
+    assert grade_selection_case(case, Observation("sel-neg", [])).tool_ok is True
 
 
 def test_negative_case_fails_when_a_tool_fires() -> None:
@@ -221,7 +221,7 @@ def test_negative_case_fails_when_a_tool_fires() -> None:
     on everything scores 100% without a negative case to contradict it.
     """
     case = {"id": "sel-neg", "expected_tool": None}
-    result = grade_selection_case(case, Observation("sel-neg", "order_book_imbalance"))
+    result = grade_selection_case(case, Observation("sel-neg", ["order_book_imbalance"]))
     assert result.tool_ok is False
     assert "expected NO tool" in " ".join(result.detail)
 
@@ -233,7 +233,7 @@ def test_args_are_scored_separately_from_routing() -> None:
         "expected_tool": "order_book_imbalance",
         "expected_args": {"coin": "ETH", "bands_bps": [25]},
     }
-    obs = Observation("sel-002", "order_book_imbalance", {"coin": "ETH", "bands_bps": [10, 50]})
+    obs = Observation("sel-002", ["order_book_imbalance"], [{"coin": "ETH", "bands_bps": [10, 50]}])
     result = grade_selection_case(case, obs)
     assert (result.tool_ok, result.args_ok) == (True, False)
 
@@ -250,7 +250,9 @@ def test_extra_args_are_not_penalised() -> None:
         "expected_args": {"wallets": ["0xabc"]},
     }
     obs = Observation(
-        "sel-003", "whale_position_monitor", {"wallets": ["0xabc"], "include_hip3": False}
+        "sel-003",
+        ["whale_position_monitor"],
+        [{"wallets": ["0xabc"], "include_hip3": False}],
     )
     result = grade_selection_case(case, obs)
     assert (result.tool_ok, result.args_ok) == (True, True)
@@ -263,7 +265,7 @@ def test_args_not_compared_when_the_tool_was_wrong() -> None:
         "expected_tool": "order_book_imbalance",
         "expected_args": {"coin": "ETH"},
     }
-    result = grade_selection_case(case, Observation("sel-002", "list_hip3_dexes", {}))
+    result = grade_selection_case(case, Observation("sel-002", ["list_hip3_dexes"], [{}]))
     assert result.args_ok is None
     assert "args not compared" in " ".join(result.detail)
 
@@ -271,4 +273,154 @@ def test_args_not_compared_when_the_tool_was_wrong() -> None:
 def test_case_without_expected_args_reports_args_ok_as_none() -> None:
     """No expected_args means there is nothing to score, not a silent pass."""
     case = {"id": "sel-005", "expected_tool": "list_hip3_dexes"}
-    assert grade_selection_case(case, Observation("sel-005", "list_hip3_dexes")).args_ok is None
+    assert grade_selection_case(case, Observation("sel-005", ["list_hip3_dexes"])).args_ok is None
+
+
+# --------------------------------------------------------------------------
+# Multi-tool turns
+#
+# Both scenarios below were observed on the first manual routing pass. They are
+# described by BEHAVIOUR rather than by dataset case id, and use their own
+# fabricated ids, so these tests keep saying something true if the dataset is
+# renumbered or its prompts reworded.
+# --------------------------------------------------------------------------
+
+
+def test_extra_tool_calls_do_not_fail_the_case() -> None:
+    """Reaching the expected tool passes even when others were called too.
+
+    Scenario: a prompt asking whether large traders are net long or short on a
+    coin -- a *positions* question, whose partner case asks the near-identical
+    *order book* question about the same coin. The model called the positions
+    tool (correct) and the book tool as well, covering both readings instead of
+    choosing between them.
+
+    That still counts as reaching the right tool. Whether the extra call was
+    worthwhile is a judgment the grader deliberately does not make: it records
+    the calls and describes them, and a human reading the notes decides.
+    """
+    case = {"id": "case-parallel", "expected_tool": "whale_position_monitor"}
+    obs = Observation("case-parallel", ["whale_position_monitor", "order_book_imbalance"])
+    result = grade_selection_case(case, obs)
+    assert result.tool_ok is True
+    assert result.observed_tools == ["whale_position_monitor", "order_book_imbalance"]
+    assert "also called order_book_imbalance" in " ".join(result.detail)
+
+
+def test_expected_tool_found_anywhere_in_the_call_order() -> None:
+    """The expected tool counts even when it was not the first one called.
+
+    Scenario: a prompt asking what whales hold on HIP-3 markets. Answering it
+    needs the deployment names first, so the model called the dex-listing tool
+    and then the position tool -- correct sequencing, not a misroute.
+
+    Grading on "the first tool called" would mark this a failure, which is why
+    membership is the test rather than position.
+    """
+    case = {"id": "case-chained", "expected_tool": "whale_position_monitor"}
+    obs = Observation("case-chained", ["list_hip3_dexes", "whale_position_monitor"])
+    assert grade_selection_case(case, obs).tool_ok is True
+
+
+def test_args_are_taken_from_the_expected_tools_own_call() -> None:
+    """With several calls, args are compared against the right one.
+
+    ``observed_args`` is positionally parallel to ``observed_tools``, so the
+    comparison must index to the expected tool's own call. Taking the first
+    call's args would compare the dex-listing call's (empty) arguments against
+    what the position tool was expected to receive.
+    """
+    case = {
+        "id": "case-chained",
+        "expected_tool": "whale_position_monitor",
+        "expected_args": {"include_hip3": True},
+    }
+    obs = Observation(
+        "case-chained",
+        ["list_hip3_dexes", "whale_position_monitor"],
+        [{}, {"include_hip3": True}],
+    )
+    result = grade_selection_case(case, obs)
+    assert (result.tool_ok, result.args_ok) == (True, True)
+
+
+def test_negative_case_fails_when_any_tool_fires() -> None:
+    """A negative case is not satisfied by calling two tools instead of one."""
+    case = {"id": "case-negative", "expected_tool": None}
+    obs = Observation("case-negative", ["order_book_imbalance", "list_hip3_dexes"])
+    assert grade_selection_case(case, obs).tool_ok is False
+
+
+# --------------------------------------------------------------------------
+# Observation.from_row — both results-file shapes
+# --------------------------------------------------------------------------
+
+
+def test_from_row_accepts_the_single_tool_shape() -> None:
+    """A results file written before multi-tool support keeps working.
+
+    One ``observed_tool`` name and one ``observed_args`` object, normalized to
+    single-element lists. Without this, adopting the list shape would mean
+    rewriting every previously recorded run.
+    """
+    obs = Observation.from_row(
+        {
+            "id": "case-single",
+            "observed_tool": "order_book_imbalance",
+            "observed_args": {"coin": "BTC"},
+            "model": "claude-sonnet-5/medium",
+        }
+    )
+    assert obs.observed_tools == ["order_book_imbalance"]
+    assert obs.args_for("order_book_imbalance") == {"coin": "BTC"}
+    assert obs.model == "claude-sonnet-5/medium"
+
+
+def test_from_row_accepts_the_multi_tool_shape() -> None:
+    """The list shape: names in call order, args positionally parallel."""
+    obs = Observation.from_row(
+        {
+            "id": "case-chained",
+            "observed_tools": ["list_hip3_dexes", "whale_position_monitor"],
+            "observed_args": [{}, {"include_hip3": True}],
+        }
+    )
+    assert obs.observed_tools == ["list_hip3_dexes", "whale_position_monitor"]
+    assert obs.args_for("whale_position_monitor") == {"include_hip3": True}
+    assert obs.args_for("list_hip3_dexes") == {}
+
+
+def test_from_row_treats_null_observed_tool_as_no_call() -> None:
+    """``"observed_tool": null`` is how "the model called nothing" is recorded.
+
+    The correct answer for a negative case, so it must normalize to an empty
+    list rather than a list containing ``None``.
+    """
+    obs = Observation.from_row({"id": "case-negative", "observed_tool": None, "observed_args": {}})
+    assert obs.observed_tools == []
+    assert obs.observed_args == []
+
+
+def test_args_for_tolerates_a_short_args_list() -> None:
+    """A partially-recorded observation still grades rather than raising.
+
+    Hand-recorded runs are the normal input here, and a missing arg entry is a
+    likely transcription gap. Treating it as ``{}`` degrades to an args mismatch
+    the reader can see, instead of an IndexError that kills the whole run.
+    """
+    obs = Observation.from_row(
+        {
+            "id": "case-parallel",
+            "observed_tools": ["whale_position_monitor", "order_book_imbalance"],
+            "observed_args": [{"include_hip3": False}],
+        }
+    )
+    assert obs.args_for("whale_position_monitor") == {"include_hip3": False}
+    assert obs.args_for("order_book_imbalance") == {}
+    assert obs.args_for("never_called") == {}
+
+
+def test_from_row_rejects_a_row_with_no_id() -> None:
+    """The id is the join key to the dataset; a row without one cannot be graded."""
+    with pytest.raises(ValueError, match="id"):
+        Observation.from_row({"observed_tool": "order_book_imbalance"})
