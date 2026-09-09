@@ -58,3 +58,129 @@ jobs:
       # malformed eval case fails CI. It runs no tools and calls no model.
       - name: Validate eval datasets
         run: uv run python evals/run_evals.py
+
+  # A separate job rather than steps appended to `gate`: it shares no tooling
+  # with it (no uv, no venv) and runs in parallel, so a PR gets the lint/test
+  # verdict and the container verdict in the same round instead of one after the
+  # other. Nothing is pushed to a registry.
+  container:
+    name: docker build · run
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # `load: true` keeps the image in the local daemon so the next step can
+      # actually run it. The Dockerfile's build-time smoke test (tool
+      # registration + packaged data) runs here and fails the build on its own.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: hlmcp:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A green build is NOT sufficient evidence the image works. A virtualenv
+      # copied between stages builds cleanly and still dies on exec, because the
+      # console script's absolute shebang points at the builder's path — the
+      # container fails with "no such file or directory" naming a file that
+      # plainly exists. Only running it catches that class of bug.
+      #
+      # Offline by design: initialize + tools/list touch no network, so the
+      # per-PR gate stays hermetic and cannot be reddened by Hyperliquid being
+      # down. Live calls belong in the nightly workflow.
+      #
+      # Scope: this step owns "does the container run and speak MCP". The tool
+      # *inventory* is asserted in the Dockerfile's smoke test, so there is one
+      # place to update when a tool is added.
+      - name: Run container · MCP handshake
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+          import threading
+          import time
+
+          # The container is a separate process reachable only over its pipes --
+          # which is not a testing workaround but exactly how MCP works: a client
+          # launches the server and speaks JSON-RPC over stdin/stdout. This stands
+          # in for Claude Desktop.
+          proc = subprocess.Popen(
+              ["docker", "run", "-i", "--rm", "hlmcp:ci"],
+              stdin=subprocess.PIPE,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              text=True,
+              bufsize=1,
+          )
+          replies: dict[int, dict] = {}
+
+          # stdout must never go unread. An OS pipe buffer is finite (~64KB): let
+          # it fill and the container blocks on write, stops reading our stdin,
+          # and both sides wait forever. A reader thread is enough -- Python
+          # releases the GIL on blocking I/O, so this makes progress while the
+          # main thread sends and waits.
+          def drain() -> None:
+              for line in proc.stdout:
+                  try:
+                      msg = json.loads(line)
+                  except ValueError:
+                      continue  # FastMCP's startup banner and other non-JSON noise
+                  if "id" in msg:  # a reply to one of our requests, not a notification
+                      replies[msg["id"]] = msg
+
+          threading.Thread(target=drain, daemon=True).start()
+
+          def send(obj: dict) -> None:
+              proc.stdin.write(json.dumps(obj) + "\n")
+              proc.stdin.flush()
+
+          def await_reply(request_id: int, timeout_s: float = 30.0) -> bool:
+              deadline = time.monotonic() + timeout_s
+              while time.monotonic() < deadline:
+                  if request_id in replies:
+                      return True
+                  if proc.poll() is not None:
+                      return False  # container died; don't spin out the timeout
+                  time.sleep(0.05)
+              return False
+
+          def die(what: str) -> None:
+              # Diagnostics live on stderr: stdout IS the protocol channel, so the
+              # server cannot print errors there without corrupting the stream.
+              print(f"::error::{what}")
+              print(proc.stderr.read())
+              sys.exit(1)
+
+          send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+              "protocolVersion": "2024-11-05", "capabilities": {},
+              "clientInfo": {"name": "ci", "version": "0"}}})
+          if not await_reply(1):
+              die("container did not answer initialize")
+          print("initialize ->", replies[1]["result"]["serverInfo"])
+
+          send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+          send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+          if not await_reply(2):
+              die("container did not answer tools/list")
+          names = sorted(tool["name"] for tool in replies[2]["result"]["tools"])
+          if not names:
+              die("tools/list returned no tools")
+          print(f"tools/list -> {len(names)}: {', '.join(names)}")
+
+          # Closing stdin simulates the client quitting (every Cmd-Q does this).
+          # Asserting a clean exit is a real check, not teardown: a non-zero code
+          # would mean the server crashes every time its client disconnects.
+          proc.stdin.close()
+          returncode = proc.wait(timeout=15)
+          if returncode != 0:
+              die(f"container exited {returncode} after stdin closed (expected 0)")
+          print("container exited cleanly")
+          PY

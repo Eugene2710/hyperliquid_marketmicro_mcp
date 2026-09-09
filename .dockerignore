@@ -1,0 +1,43 @@
+# Keep the build context small and free of anything host-specific or secret.
+# Everything the image needs is: pyproject.toml, uv.lock, src/, README.md, LICENSE.
+
+# Secrets — must never enter the build context, let alone a layer.
+.env
+.env.*
+!.env.example
+
+# Host virtualenv. Platform-specific (macOS binaries), large, and its editable
+# install .pth would be meaningless in the image — the wheel is installed properly.
+.venv/
+
+# VCS and CI
+.git/
+.github/
+.gitignore
+
+# Tooling caches
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build artifacts (the image builds its own)
+dist/
+build/
+*.egg-info/
+
+# Not needed at runtime. Tests run in CI, not during the image build: coupling
+# the two slows every build and duplicates a gate CI already owns. The build
+# instead smoke-tests the finished artifact (see Dockerfile).
+tests/
+evals/
+docs/
+data_exploration/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store

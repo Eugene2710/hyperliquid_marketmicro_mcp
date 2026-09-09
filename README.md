@@ -107,6 +107,29 @@ positioning on Hyperliquid."*
 If the server won't start, check Claude Desktop's log
 (`~/Library/Logs/Claude/mcp-server-hlmcp.log` on macOS).
 
+### Run it in Docker
+
+```bash
+docker build -t hlmcp:latest .
+```
+
+```json
+{
+  "mcpServers": {
+    "hlmcp": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "hlmcp:latest"]
+    }
+  }
+}
+```
+
+The `-i` is **required** — this server speaks MCP over stdio, so stdin/stdout
+carry the JSON-RPC stream. (No `-t`: the peer is a pipe, not a terminal. No
+published port: there is no socket.) Config is env-driven and every variable is
+optional — override with `-e`, e.g. `-e HL_BURST_CAPACITY=20`; see
+`.env.example`.
+
 ### Developing against your working copy
 
 Both configs above run an *installed* copy, so edits to `src/` won't show up. To
