@@ -116,7 +116,13 @@ async def order_book_imbalance(
         coin: Symbol, e.g. ``"BTC"``, ``"ETH"``, ``"xyz:MSTR"`` (a HIP-3 market),
             or ``"@150"`` (a spot index).
         bands_bps: Basis-point band half-widths from mid to evaluate, each > 0.
-            Defaults to ``[10, 25, 50, 100]`` when omitted.
+            Defaults to ``[10, 25, 50, 100]`` when omitted. **Request only the
+            bands you need.** Resolution is sized from the WIDEST band in the
+            call, so adding a wide band coarsens the narrow ones in the same
+            call: asking ``[25]`` measures the 25bps band roughly 10x more
+            finely than asking ``[10, 25, 50]`` does. To get both a sharp
+            reading near mid and wider context, make two separate calls rather
+            than one call with a wide span.
 
     Returns:
         An :class:`OrderBookImbalanceResponse`: per-band imbalance, mid price,
