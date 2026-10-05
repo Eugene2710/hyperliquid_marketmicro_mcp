@@ -125,8 +125,9 @@ async def order_book_imbalance(
             than one call with a wide span.
 
     Returns:
-        An :class:`OrderBookImbalanceResponse`: per-band imbalance, mid price,
-        achieved bucket width, level counts, and freshness.
+        An :class:`OrderBookImbalanceResponse`: per-band imbalance measured from
+        the book's mid price, the ACTUAL bucket width achieved, level counts, and
+        freshness metadata.
     """
     bands: Sequence[float] = bands_bps if bands_bps else DEFAULT_BANDS_BPS
     return await compute_order_book_imbalance(_require_venue(), coin, bands)
