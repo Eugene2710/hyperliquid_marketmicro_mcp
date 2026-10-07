@@ -9,6 +9,8 @@
 # Host virtualenv. Platform-specific (macOS binaries), large, and its editable
 # install .pth would be meaningless in the image — the wheel is installed properly.
 .venv/
+.venv
+.venv.nosync/
 
 # VCS and CI
 .git/
