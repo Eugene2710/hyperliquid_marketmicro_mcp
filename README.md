@@ -161,7 +161,7 @@ the window isn't enough.
 
 ## Tools
 
-Three read-only tools. Every response carries a `freshness` object
+Four read-only tools. Every response carries a `freshness` object
 (`server_time_ms`, `fetched_at_ms`, `staleness_ms`) so the model can reason about
 data age.
 
@@ -207,19 +207,40 @@ List the HIP-3 perp deployments on Hyperliquid.
 - `perpDexs` carries no server timestamp, so `freshness` reflects local fetch time
   only.
 
+### `funding_carry`
+
+Current and realized funding, and annualized carry by side, for **one** perp.
+
+- **In:** `coin` — exact, case-sensitive HL symbol (`"BTC"`, `"kPEPE"`, or a HIP-3
+  market such as `"xyz:XYZ100"`); `lookback_hours` — realized window, 1–720
+  (default 168 = 7 days). Unknown or delisted symbols are rejected.
+- **Out:** the current predicted hourly rate (annualized), premium, mark-vs-oracle
+  basis and open interest; `carry_annualized_long` / `_short` at that rate
+  (**positive = that side receives funding**, negative = it pays); realized stats
+  over the window (mean, cumulative, min/max, share of hours positive); the next
+  hourly settlement; and, for native coins, **HL vs Binance vs Bybit** predicted
+  rates normalized per hour (each venue quotes per its own interval — 8h for BTC on
+  Binance/Bybit). `cross_venue` is `null` for HIP-3 markets.
+- HL convention: positive funding = longs pay shorts. Annualization is **simple**
+  (hourly × 8760, no compounding), and carry is a run-rate at the current rate,
+  not a forecast.
+- The live ctx has no server timestamp, so `freshness` is anchored on the newest
+  *settled* funding row: `staleness_ms` up to ~1h is expected.
+
 ## Using it well
 
 You don't call these tools directly — you ask Claude (or any MCP client) in plain
 language, and it picks the tool and reasons over the structured result. The value
-compounds when you **chain the three tools into one decision** and let the freshness
+compounds when you **chain the tools into one decision** and let the freshness
 and bucket-width metadata qualify every read.
 
 Mental model:
 
 - **`whale_position_monitor`** → positioning *bias* and *liquidation-cascade risk*.
 - **`order_book_imbalance`** → near-term *buy/sell pressure* and *execution timing*.
+- **`funding_carry`** → the *cost (or yield) of holding* a perp, by side.
 - **`list_hip3_dexes`** → *widen the lens* to non-native markets, then feed the `dex`
-  back into the other two.
+  back into the others.
 
 Example prompts:
 
@@ -314,7 +335,7 @@ Scope is deliberately narrow for v0:
 ```
 src/hlmcp/
   config.py                    # env-driven HLConfig + load_config (rate/concurrency/timeout knobs)
-  server.py                    # FastMCP app: 3 @mcp.tool wrappers + shared-venue lifespan; main() = hlmcp-server
+  server.py                    # FastMCP app: 4 @mcp.tool wrappers + shared-venue lifespan; main() = hlmcp-server
   schemas/
     hl_api.py                  # raw HL API shapes (HL*-prefixed; strings stay strings, nothing computed)
     responses.py               # user-facing response models (FreshnessMeta, *Response)
@@ -325,11 +346,13 @@ src/hlmcp/
     aggregation.py             # choose_aggregation: price-aware l2Book bucket sizing
     imbalance.py               # compute_imbalance across bp bands
     positions.py               # position aggregation + account-level liquidation buffer
+    funding.py                 # funding stats, carry by side, cross-venue per-hour normalization
     utils.py                   # normalize_wallet, decimal/parse helpers
   tools/                       # one MCP tool per file (thin: venue -> analytics -> response)
     order_book_imbalance.py    #   depth-weighted book imbalance
     whale_position_monitor.py  #   whale positions + account risk (loads the curated set)
     list_hip3_dexes.py         #   HIP-3 deployment catalog
+    funding_carry.py           #   current/realized funding + carry by side
   data/
     curated_whales.json        # default whale set (provenance documented); shipped inside the wheel
 evals/                         # eval skeleton: datasets/*.jsonl + run_evals.py (validates format; graders post-v0)

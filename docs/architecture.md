@@ -30,18 +30,20 @@ flowchart TD
     client["MCP client<br/>Claude Desktop · Cursor · LangGraph"]
     hlapi[("Hyperliquid<br/>public REST /info")]
 
-    server["server.py · FastMCP<br/>registers 3 tools · owns one shared read-only venue (lifespan)"]
+    server["server.py · FastMCP<br/>registers 4 tools · owns one shared read-only venue (lifespan)"]
 
     subgraph L4["tools/ · thin orchestration (only layer mixing I/O + compute)"]
         obi["order_book_imbalance"]
         wpm["whale_position_monitor"]
         lhd["list_hip3_dexes"]
+        fc["funding_carry"]
     end
 
     subgraph L3["analytics/ · PURE functions (no I/O, no async)"]
         agg["aggregation<br/>choose_aggregation"]
         imb["imbalance<br/>compute_imbalance"]
         pos["positions<br/>aggregate + account risk"]
+        fnd["funding<br/>realized stats · carry · cross-venue"]
     end
 
     subgraph L2["venues/ · read-only REST adapter"]
@@ -54,16 +56,17 @@ flowchart TD
     end
 
     client -- "stdio / MCP" --> server
-    server --> obi & wpm & lhd
+    server --> obi & wpm & lhd & fc
 
     obi --> agg & imb & hp
     wpm --> pos & hp
     lhd --> hp
+    fc --> fnd & hp
 
     hp -- "HTTP" --> hlapi
     hp --> hlraw
-    agg & imb & pos --> hlraw
-    obi & wpm & lhd --> rspn
+    agg & imb & pos & fnd --> hlraw
+    obi & wpm & lhd & fc --> rspn
 ```
 
 A single tool call flows through the layers like this (using
@@ -219,7 +222,8 @@ revisits them deliberately rather than treating them as settled.
   **Confidence: low. Revisit once tools are live and burst patterns are visible.**
 
 - **Retry attempt count and backoff are engineering estimates, not measured. 
-  Step 4 added a tenacity retry at the venue's _post, retryable-only 
+  The first end-to-end tool (`order_book_imbalance`) added a tenacity retry at
+  the venue's _post, retryable-only 
   (timeouts / transport errors / 5xx; never 4xx, which are deterministic). 
   _MAX_ATTEMPTS = 3 and the backoff (initial 0.25s, max 2.0s, exponential + jitter)
   are module constants chosen as a resilience margin — the spike saw zero 
@@ -280,6 +284,31 @@ revisits them deliberately rather than treating them as settled.
 - **Package/distribution name.** Import name `hlmcp`; PyPI name likely
   `hyperliquid-microstructure-mcp`. **Confidence: medium; revisit before publish.**
 
+- **`funding_carry` freshness anchor.** `metaAndAssetCtxs` (the live
+  predicted rate, premium, prices) has NO server timestamp. `FreshnessMeta` is
+  therefore anchored on the newest *settled* `fundingHistory` row, so
+  `staleness_ms` honestly reads "realized data is up to ~1h old"; with no
+  settlements in the window it falls back to fetch time (staleness 0). The
+  alternative — anchoring on fetch time — would always read ~0 and overstate
+  freshness. Cost: the live ctx's own ~500ms age is only stated in the docstring,
+  not measured. `FreshnessMeta` itself was not changed.
+  **Confidence: medium. Revisit if a client misreads the ~1h staleness as broken data.**
+
+- **`funding_carry` default lookback = 168h (7 days); max 720h.** 168h spans a
+  full weekday/weekend cycle; 24h or 720h would be equally defensible. 720h is
+  two `fundingHistory` pages (500-row cap), bounding a call at 4 HTTP requests.
+  **Confidence: low on the default; it is a judgment call.**
+
+- **Funding annualization is simple (`hourly × 8760`), no compounding.** The
+  convention traders quote for funding; labelled "simple" in every field name so
+  it is not read as an APY. Carry is a run-rate at the *current predicted* rate,
+  not a forecast. **Confidence: high on the convention; it is a labelling choice.**
+
+- **Cross-venue comparison trusts `predictedFundings`' `fundingIntervalHours`.**
+  When a venue omits it (observed on some coins), the normalized fields are
+  `None` rather than a guessed 8h. HIP-3 markets get no comparison at all
+  (`predictedFundings` covers native coins only). **Confidence: medium-high.**
+
 ## Testing strategy
 
 Three test types, each with a distinct purpose. They are written WITH the code in
@@ -299,7 +328,7 @@ each build step, never deferred to a separate testing phase.
   can be rate-limited, and may be flaky. Run them deliberately before releases
   and when changing the venue layer.
 
-- **E2E tests (from Step 4 onward)** — the MCP server installed in Claude Desktop
+- **E2E tests (from the first installable tool, `order_book_imbalance`, onward)** — the MCP server installed in Claude Desktop
   (or the MCP inspector), invoked as an LLM would invoke it, verifying the whole
   path including the MCP protocol layer. Partly manual for v0 (install, ask the
   LLM to call the tool, verify the response). Automatable later via the MCP
