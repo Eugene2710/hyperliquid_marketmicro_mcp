@@ -6,7 +6,7 @@ Two rules govern everything in this module:
 1. **Numerics stay strings.** The HL API serializes all monetary/size/price
    values as decimal *strings* to preserve precision. We keep them as ``str``
    here and parse to ``float``/``Decimal`` only in the user-facing response layer
-   (``schemas/responses.py``, Step 4). Nothing is computed or coerced here.
+   (``schemas/responses.py``). Nothing is computed or coerced here.
 2. **Mirror, don't interpret.** A parse failure against these models means the
    API shape changed — that is the signal we want, not something to paper over.
 
@@ -59,7 +59,14 @@ class Leverage(BaseModel):
 
 
 class CumFunding(BaseModel):
-    """Cumulative funding on a position, in USD (negative = paid, positive = received).
+    """Cumulative funding on a position, in USD (positive = paid, negative = received).
+
+    The sign is a COST: it is the negation of the cash flow in HL's
+    ``userFunding`` ledger, whose ``usdc`` delta is negative when funding is paid.
+    Verified live 2026-10-06 (api_spike_findings.md, Funding → Sign conventions):
+    8/8 longs paying at a positive rate showed positive ``sinceChange``, and a
+    short that received +26.230339 USD in its one settlement since the last size
+    change showed ``sinceChange`` = -26.230339.
 
     All values are USD amounts serialized as strings. The three timeframes have
     distinct reset semantics:
@@ -268,8 +275,8 @@ class HLL2Book(BaseModel):
         time: Server timestamp, milliseconds since epoch.
         levels: ``[bid_levels, ask_levels]``, each up to 20 entries.
         spread: Top-of-book spread as a decimal string. (Observed live but not
-            documented in the original spike notes — flagged in the Step 1
-            summary; ``Optional`` defensively in case older responses omit it.)
+            documented in the original spike notes — flagged when these schemas
+            were first validated against recorded fixtures; ``Optional`` defensively in case older responses omit it.)
     """
 
     coin: str = Field(description="Symbol this book is for.")
@@ -295,7 +302,8 @@ class HLPerpDex(BaseModel):
     ``assetToFundingInterestRate``, ``assetToFundingMultiplier``,
     ``deployerFeeScale``, ``lastDeployerFeeScaleChangeTime``, ``subDeployers``).
     Rather than break on the next addition, we declare what we have observed and
-    retain anything new. Flagged in the Step 1 summary.
+    retain anything new. Flagged when these schemas were first validated against
+    recorded fixtures.
 
     Only ``name`` is load-bearing for v0 (the dex routing key for
     ``clearinghouseState``'s ``dex`` field); the rest is metadata surfaced by the
@@ -372,3 +380,197 @@ class HLPerpDexs(RootModel[list[HLPerpDex | None]]):
             All non-null entries in the response, in API order.
         """
         return [d for d in self.root if d is not None]
+
+
+# --------------------------------------------------------------------------- #
+# metaAndAssetCtxs (per-asset live context: funding, premium, prices, OI)     #
+# --------------------------------------------------------------------------- #
+
+
+class HLUniverseAsset(BaseModel):
+    """One market in a dex's ``meta.universe`` (index-aligned with its asset ctx).
+
+    ``extra="allow"`` for the same reason as :class:`HLPerpDex`: HIP-3 universes
+    carry extra per-asset fields (``growthMode``, ``deployerFeeScale``,
+    ``lastFeeScaleChangeTime``, ...) that native HL does not. Only ``name`` is
+    load-bearing (the lookup key for the matching ctx).
+
+    Attributes:
+        name: Market symbol; HIP-3 names come back dex-prefixed (``"xyz:XYZ100"``).
+        szDecimals: Size decimals for the market.
+        maxLeverage: Symbol leverage ceiling.
+        isDelisted: ``True`` for delisted markets; absent (``None``) otherwise.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str = Field(description="Market symbol; HIP-3 names are dex-prefixed.")
+    szDecimals: int = Field(description="Size decimals for the market.")
+    maxLeverage: int = Field(description="Symbol leverage ceiling.")
+    isDelisted: bool | None = Field(
+        default=None, description="True for delisted markets; absent otherwise."
+    )
+
+
+class HLMeta(BaseModel):
+    """The ``meta`` half of ``metaAndAssetCtxs``.
+
+    ``marginTables``/``collateralToken`` are present on the wire but unused, so
+    they are ignored (default ``extra="ignore"``).
+
+    Attributes:
+        universe: The dex's markets, index-aligned with the ctx list.
+    """
+
+    universe: list[HLUniverseAsset] = Field(description="Markets, index-aligned with ctxs.")
+
+
+class HLAssetCtx(BaseModel):
+    """Live per-asset context from ``metaAndAssetCtxs`` (decimal strings).
+
+    ``funding`` is the PREDICTED rate for the current hourly interval, expressed
+    per hour (HL settles funding hourly). It carries no server timestamp.
+
+    ``premium``, ``midPx`` and ``impactPxs`` are ``null`` for delisted markets
+    (observed 56/234 native, 21/131 on ``xyz``, 2026-10-05).
+
+    Attributes:
+        funding: Predicted hourly funding rate for the current interval.
+        openInterest: Open interest in coin units.
+        prevDayPx: Price 24h ago.
+        dayNtlVlm: 24h notional volume, USD.
+        premium: Current premium (mark vs oracle input to funding), or ``None``.
+        oraclePx: Oracle price.
+        markPx: Mark price.
+        midPx: Book mid, or ``None`` when there is no book.
+        impactPxs: ``[impact_bid, impact_ask]`` prices, or ``None``.
+        dayBaseVlm: 24h volume in coin units.
+    """
+
+    funding: str = Field(description="Predicted hourly funding rate, current interval.")
+    openInterest: str = Field(description="Open interest, coin units.")
+    prevDayPx: str = Field(description="Price 24h ago.")
+    dayNtlVlm: str = Field(description="24h notional volume, USD.")
+    premium: str | None = Field(default=None, description="Current premium; null if delisted.")
+    oraclePx: str = Field(description="Oracle price.")
+    markPx: str = Field(description="Mark price.")
+    midPx: str | None = Field(default=None, description="Book mid; null if no book.")
+    impactPxs: list[str] | None = Field(
+        default=None, description="[impact_bid, impact_ask]; null if delisted."
+    )
+    dayBaseVlm: str = Field(description="24h volume, coin units.")
+
+
+class HLMetaAndAssetCtxs(RootModel[tuple[HLMeta, list[HLAssetCtx]]]):
+    """The ``metaAndAssetCtxs`` response: a 2-element ``[meta, ctxs]`` array.
+
+    ``meta.universe[i]`` and ``ctxs[i]`` describe the same market; the pairing is
+    purely positional. Use :meth:`ctx_for` to look a market up by name.
+    """
+
+    @property
+    def meta(self) -> HLMeta:
+        """Return the ``meta`` half (universe)."""
+        return self.root[0]
+
+    @property
+    def ctxs(self) -> list[HLAssetCtx]:
+        """Return the ctx half, index-aligned with ``meta.universe``."""
+        return self.root[1]
+
+    def ctx_for(self, coin: str) -> tuple[HLUniverseAsset, HLAssetCtx] | None:
+        """Look up a market's universe entry and ctx by exact symbol.
+
+        Mechanism: linear scan of ``meta.universe`` for ``name == coin``, returning
+        the entry and the ctx at the same index.
+
+        Args:
+            coin: Exact symbol, e.g. ``"BTC"`` or ``"xyz:XYZ100"`` (case-sensitive).
+
+        Returns:
+            ``(asset, ctx)`` for the market, or ``None`` if it is not listed.
+        """
+        for i, asset in enumerate(self.meta.universe):
+            if asset.name == coin:
+                return asset, self.ctxs[i]
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# fundingHistory                                                              #
+# --------------------------------------------------------------------------- #
+
+
+class HLFundingHistoryEntry(BaseModel):
+    """One hourly funding settlement from ``fundingHistory``.
+
+    Rows come oldest-first, at most 500 per response (api_spike_findings.md,
+    Funding section) — longer windows must be paged.
+
+    Attributes:
+        coin: Symbol (echoes the request; HIP-3 names dex-prefixed).
+        fundingRate: Settled hourly funding rate (decimal string). Positive means
+            longs paid shorts.
+        premium: Premium sampled for this interval (decimal string).
+        time: Settlement timestamp, milliseconds since epoch.
+    """
+
+    coin: str = Field(description="Symbol for this settlement.")
+    fundingRate: str = Field(description="Settled hourly rate; positive = longs paid shorts.")
+    premium: str = Field(description="Premium for this interval.")
+    time: int = Field(description="Settlement time, ms since epoch.")
+
+
+# --------------------------------------------------------------------------- #
+# predictedFundings (cross-venue)                                             #
+# --------------------------------------------------------------------------- #
+
+
+class HLVenueFunding(BaseModel):
+    """One venue's predicted funding for a coin, from ``predictedFundings``.
+
+    ``fundingRate`` is per THAT venue's own interval (e.g. 8h on Binance/Bybit,
+    1h on HL), so compare only after dividing by ``fundingIntervalHours``.
+    ``fundingIntervalHours`` is sometimes absent (observed on ``BinPerp`` for
+    some coins, 2026-10-05), in which case the rate cannot be normalized.
+
+    HL's own ``nextFundingTime`` equals the most recent settlement (it lags one
+    interval; 4/4 snapshots, 2026-10-05/06), so it is in the past; do not use it
+    as the next settlement.
+
+    Attributes:
+        fundingRate: Predicted rate per ``fundingIntervalHours``.
+        nextFundingTime: Venue-reported next settlement, ms since epoch.
+        fundingIntervalHours: The venue's funding interval, or ``None`` if absent.
+    """
+
+    fundingRate: str = Field(description="Predicted rate per the venue's own interval.")
+    nextFundingTime: int = Field(description="Venue-reported next settlement, ms epoch.")
+    fundingIntervalHours: int | None = Field(
+        default=None, description="Venue funding interval in hours; may be absent."
+    )
+
+
+class HLPredictedFundings(RootModel[list[tuple[str, list[tuple[str, HLVenueFunding | None]]]]]):
+    """The ``predictedFundings`` response: ``[[coin, [[venue, funding|null], ...]], ...]``.
+
+    Covers native HL coins only (no HIP-3 symbols). Venue keys observed:
+    ``BinPerp``, ``HlPerp``, ``BybitPerp``. A venue entry is ``null`` when that
+    venue does not list the coin.
+    """
+
+    def for_coin(self, coin: str) -> list[tuple[str, HLVenueFunding | None]] | None:
+        """Return the per-venue entries for ``coin``, or ``None`` if absent.
+
+        Mechanism: linear scan of the root list for the matching coin name.
+
+        Args:
+            coin: Exact native symbol, e.g. ``"BTC"``.
+
+        Returns:
+            The ``(venue, funding | None)`` list for the coin, or ``None``.
+        """
+        for name, venues in self.root:
+            if name == coin:
+                return venues
+        return None
