@@ -11,8 +11,9 @@ wheels/
 .pytest_cache/
 .ruff_cache/
 
-# Virtual environments
+# Virtual environments (.venv is a symlink to .venv.nosync, which iCloud skips)
 .venv
+.venv.nosync/
 
 # keys and wallets
 .env

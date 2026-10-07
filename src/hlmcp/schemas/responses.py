@@ -18,6 +18,7 @@ Pydantic v2 (``model_validate``/``model_dump``); no I/O here.
 
 from pydantic import BaseModel, Field
 
+from hlmcp.analytics.funding import CurrentFunding, RealizedFunding, VenueRate
 from hlmcp.analytics.imbalance import ImbalanceBand
 from hlmcp.analytics.positions import AccountRisk, PositionAggregate, PositionSummary
 
@@ -268,4 +269,56 @@ class ListHip3DexesResponse(BaseModel):
     n_dexes: int = Field(ge=0, description="Number of HIP-3 deployments returned.")
     freshness: FreshnessMeta = Field(
         description="Local fetch-time metadata (perpDexs has no server timestamp)."
+    )
+
+
+class FundingCarryResponse(BaseModel):
+    """Result of the ``funding_carry`` tool for one market.
+
+    Sign convention (HL's): a positive funding rate means longs pay shorts.
+    ``carry_annualized_long``/``_short`` are what each side RECEIVES (positive) or
+    PAYS (negative), annualized simple (``hourly * 8760``, no compounding), at the
+    CURRENT predicted rate - funding changes every hour, so these are a run-rate,
+    not a forecast. ``realized`` shows what actually settled over the lookback.
+
+    Freshness note: ``metaAndAssetCtxs`` (the live ``current`` block) carries NO
+    server timestamp; it is a REST snapshot about as fresh as other HL REST data
+    (~500ms). :attr:`freshness` is therefore anchored on the newest SETTLED
+    funding row, so ``staleness_ms`` reads as the age of the realized data (up to
+    ~1h by construction). With no settlements in the window it falls back to the
+    local fetch time.
+
+    Attributes:
+        coin: Market symbol (HIP-3 names dex-prefixed).
+        dex: Dex the market lives on (``""`` for native HL).
+        current: Live predicted funding, premium, mark/oracle basis, open interest.
+        next_settlement_ms: Next hourly settlement, ms since epoch.
+        carry_annualized_long: Annualized carry for a long at the current rate.
+        carry_annualized_short: Annualized carry for a short at the current rate.
+        lookback_hours: Requested realized-funding window, hours.
+        realized: Statistics over settled funding in the window.
+        cross_venue: HL vs Binance/Bybit predicted rates normalized per hour, or
+            ``None`` for HIP-3 markets (``predictedFundings`` covers native only).
+        freshness: Data-age metadata (see the note above).
+    """
+
+    coin: str = Field(description="Market symbol; HIP-3 names are dex-prefixed.")
+    dex: str = Field(description="Dex of the market; '' for native HL.")
+    current: CurrentFunding = Field(description="Live predicted funding and market context.")
+    next_settlement_ms: int = Field(description="Next hourly settlement, ms since epoch.")
+    carry_annualized_long: float = Field(
+        description="Annualized simple carry for a long at the current rate; + = receives."
+    )
+    carry_annualized_short: float = Field(
+        description="Annualized simple carry for a short at the current rate; + = receives."
+    )
+    lookback_hours: int = Field(ge=1, description="Realized-funding window, hours.")
+    realized: RealizedFunding = Field(description="Settled funding statistics over the window.")
+    cross_venue: list[VenueRate] | None = Field(
+        default=None,
+        description="Predicted rates on HL/Binance/Bybit, per-hour normalized; "
+        "None for HIP-3 markets (not covered by predictedFundings).",
+    )
+    freshness: FreshnessMeta = Field(
+        description="Anchored on the newest settled funding row (ctx has no timestamp)."
     )

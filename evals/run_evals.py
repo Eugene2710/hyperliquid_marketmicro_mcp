@@ -63,6 +63,10 @@ from evals.grader import (  # noqa: E402 - must follow the sys.path bootstrap
 )
 from hlmcp.config import load_config  # noqa: E402
 from hlmcp.server import mcp  # noqa: E402
+from hlmcp.tools.funding_carry import (  # noqa: E402
+    DEFAULT_LOOKBACK_HOURS,
+    compute_funding_carry,
+)
 from hlmcp.tools.list_hip3_dexes import compute_list_hip3_dexes  # noqa: E402
 from hlmcp.tools.order_book_imbalance import (  # noqa: E402
     DEFAULT_BANDS_BPS,
@@ -287,6 +291,9 @@ async def _call_tool(venue: HyperliquidPublic, tool: str, args: dict[str, Any]) 
         )
     if tool == "list_hip3_dexes":
         return await compute_list_hip3_dexes(venue)
+    if tool == "funding_carry":
+        hours: Any = args.get("lookback_hours") or DEFAULT_LOOKBACK_HOURS
+        return await compute_funding_carry(venue, str(args["coin"]), int(hours))
     raise ValueError(f"no dispatch for tool {tool!r}")
 
 

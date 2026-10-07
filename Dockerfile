@@ -77,7 +77,7 @@ import asyncio; \
 from hlmcp.server import mcp; \
 from hlmcp.tools.whale_position_monitor import load_curated_whales; \
 tools = asyncio.run(mcp.list_tools()); \
-assert len(tools) == 3, f'expected 3 tools, got {len(tools)}'; \
+assert len(tools) == 4, f'expected 4 tools, got {len(tools)}'; \
 wallets = load_curated_whales(); \
 assert wallets, 'curated_whales.json missing or has no wallets in the wheel'; \
 print(f'smoke ok: {len(tools)} tools, {len(wallets)} curated wallets')"

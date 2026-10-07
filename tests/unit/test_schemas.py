@@ -13,9 +13,12 @@ import pytest
 
 from hlmcp.schemas.hl_api import (
     HLClearinghouseState,
+    HLFundingHistoryEntry,
     HLL2Book,
+    HLMetaAndAssetCtxs,
     HLPerpDexs,
     HLPosition,
+    HLPredictedFundings,
 )
 
 # --------------------------------------------------------------------------- #
@@ -148,3 +151,84 @@ def test_perpdexs_retains_new_fields(load_json: Callable[[str], Any]) -> None:
     assert xyz.subDeployers is not None
     assert xyz.deployerFeeScale is not None
     assert xyz.assetToStreamingOiCap is not None
+
+
+# --------------------------------------------------------------------------- #
+# metaAndAssetCtxs / fundingHistory / predictedFundings                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_meta_and_asset_ctxs_native_parses_index_aligned(
+    load_json: Callable[[str], Any],
+) -> None:
+    """Native ``[meta, ctxs]`` parses with universe and ctxs the same length."""
+    resp = HLMetaAndAssetCtxs.model_validate(load_json("meta_and_asset_ctxs.json"))
+
+    assert len(resp.meta.universe) == len(resp.ctxs) == 234
+    found = resp.ctx_for("BTC")
+    assert found is not None
+    asset, ctx = found
+    assert asset.name == "BTC"
+    assert ctx.funding == "0.0000125"  # recorded: the interest-rate floor
+    assert resp.ctx_for("btc") is None  # lookup is case-sensitive
+
+
+def test_meta_and_asset_ctxs_delisted_has_null_premium(
+    load_json: Callable[[str], Any],
+) -> None:
+    """A delisted market (MATIC) is flagged and carries null premium/mid/impact."""
+    resp = HLMetaAndAssetCtxs.model_validate(load_json("meta_and_asset_ctxs.json"))
+
+    found = resp.ctx_for("MATIC")
+    assert found is not None
+    asset, ctx = found
+    assert asset.isDelisted is True
+    assert ctx.premium is None
+    assert ctx.midPx is None
+    assert ctx.impactPxs is None
+
+
+def test_meta_and_asset_ctxs_hip3_prefixed_and_extra_fields(
+    load_json: Callable[[str], Any],
+) -> None:
+    """HIP-3 (xyz) names come back dex-prefixed and HIP-3-only fields are kept."""
+    resp = HLMetaAndAssetCtxs.model_validate(load_json("meta_and_asset_ctxs_xyz.json"))
+
+    assert len(resp.meta.universe) == len(resp.ctxs)
+    assert all(a.name.startswith("xyz:") for a in resp.meta.universe)
+    found = resp.ctx_for("xyz:XYZ100")
+    assert found is not None
+    asset, _ = found
+    assert asset.model_extra is not None
+    assert "growthMode" in asset.model_extra
+
+
+def test_funding_history_parses_oldest_first(load_json: Callable[[str], Any]) -> None:
+    """168 hourly BTC settlements parse, ascending in time, ~1h apart."""
+    rows = [HLFundingHistoryEntry.model_validate(r) for r in load_json("funding_history_btc.json")]
+
+    assert len(rows) == 168
+    assert all(r.coin == "BTC" for r in rows)
+    times = [r.time for r in rows]
+    assert times == sorted(times)
+    gaps = {round((b - a) / 3_600_000) for a, b in zip(times, times[1:], strict=False)}
+    assert gaps == {1}
+
+
+def test_predicted_fundings_parses_with_nulls_and_missing_interval(
+    load_json: Callable[[str], Any],
+) -> None:
+    """predictedFundings parses null venue entries and absent intervals."""
+    resp = HLPredictedFundings.model_validate(load_json("predicted_fundings.json"))
+
+    btc = resp.for_coin("BTC")
+    assert btc is not None
+    by_venue = dict(btc)
+    assert set(by_venue) == {"BinPerp", "HlPerp", "BybitPerp"}
+    assert by_venue["HlPerp"] is not None and by_venue["HlPerp"].fundingIntervalHours == 1
+    assert by_venue["BinPerp"] is not None and by_venue["BinPerp"].fundingIntervalHours == 8
+    entries = [f for _, venues in resp.root for _, f in venues]
+    assert any(f is None for f in entries)  # venue does not list the coin
+    assert any(f is not None and f.fundingIntervalHours is None for f in entries)
+    assert all(":" not in coin for coin, _ in resp.root)  # native coins only
+    assert resp.for_coin("NOT_A_COIN") is None

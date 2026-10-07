@@ -1,5 +1,5 @@
-# Distribution name is the descriptive `hyperliquid-microstructure-mcp` (settled at
-# Step 6 from architecture.md's "Open questions" lean) — discoverable and unlikely
+# Distribution name is the descriptive `hyperliquid-microstructure-mcp` (settled when
+# packaging for PyPI, from architecture.md's "Open questions" lean) — discoverable and unlikely
 # to collide on PyPI. The IMPORT name stays the short `hlmcp` (see the wheel target
 # below): `pip install hyperliquid-microstructure-mcp`, then `import hlmcp`.
 [project]

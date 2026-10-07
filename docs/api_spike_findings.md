@@ -189,6 +189,71 @@ market); `@150` (spot index). Spot uses `PURR/USDC` for PURR and `@{index}`
 otherwise. Remapping gotcha: BTC/USDC in the HL app is UBTC/USDC on mainnet
 HyperCore — use the L1 name to detect remappings.
 
+## Funding — metaAndAssetCtxs / fundingHistory / predictedFundings (live-probed 2026-10-05)
+
+Probed with read-only curl while planning the `funding_carry` tool; fixtures
+recorded the same day (`tests/fixtures/meta_and_asset_ctxs*.json`,
+`funding_history_btc.json`, `predicted_fundings.json`).
+
+**`metaAndAssetCtxs`** (`{"type": "metaAndAssetCtxs", "dex": ""}`):
+- Returns `[meta, ctxs]`. `meta.universe[i]` and `ctxs[i]` describe the same
+  market — the pairing is **purely positional** (native: 234 / 234).
+- Ctx fields (all strings): `funding`, `premium`, `oraclePx`, `markPx`, `midPx`,
+  `openInterest` (coin units), `dayNtlVlm`, `impactPxs`, `prevDayPx`, `dayBaseVlm`.
+- `funding` is the **predicted rate for the current hour, per hour** (HL settles
+  hourly). BTC showed `0.0000125` = the interest-rate floor (0.01% / 8h).
+- `premium`, `midPx`, `impactPxs` are **`null` for delisted markets**
+  (`isDelisted: true` on the universe entry; e.g. `MATIC`). Observed 56/234
+  native, 21/131 on `xyz`.
+- HIP-3 works with `"dex": "xyz"`; universe names come back **dex-prefixed**
+  (`xyz:XYZ100`), and HIP-3 universe entries carry extra fields (`growthMode`,
+  `deployerFeeScale`, `lastFeeScaleChangeTime`) → `extra="allow"`.
+- **No server timestamp anywhere in the response.**
+
+**`fundingHistory`** (`{"type": "fundingHistory", "coin", "startTime", "endTime"?}`):
+- Rows `{coin, fundingRate, premium, time}`, one per hourly settlement,
+  **oldest first** from `startTime`; `endTime` is honored.
+- **At most 500 rows per response.** A 60-day request returned exactly the oldest
+  500 hours — longer windows must be paged (next `startTime` = last row's
+  `time + 1`). Settlement `time`s carry a few ms of jitter past the hour.
+- HIP-3 coins work with the prefixed name (`xyz:XYZ100`).
+- **Unknown coin → HTTP 500 with body `null`.** 5xx is retryable in our tenacity
+  policy, so a typo would burn 3 attempts. Validate the coin against the
+  `metaAndAssetCtxs` universe BEFORE calling (the `funding_carry` tool does).
+
+**`predictedFundings`** (`{"type": "predictedFundings"}`):
+- `[[coin, [[venue, {fundingRate, nextFundingTime, fundingIntervalHours} | null], ...]], ...]`,
+  venues `BinPerp`, `HlPerp`, `BybitPerp` — the only three venues the endpoint
+  returns. **Native coins only** (no `:` names).
+- Rates are **per each venue's own interval** (BTC: Binance/Bybit 8h, HL 1h;
+  some coins 4h) → divide by `fundingIntervalHours` before comparing.
+- A venue entry is `null` when that venue does not list the coin (70 entries in
+  the fixture); `fundingIntervalHours` is **sometimes absent** (21 entries) → the
+  normalized rate is left `None`, not guessed.
+- **HL's own `nextFundingTime` equals the most recent settlement — it lags one
+  interval, so it is in the past.** 4/4 snapshots (fixture 2026-10-05, 3 live
+  2026-10-06): at 02:35 UTC, with the last BTC settlement at 02:00 per
+  `fundingHistory`, `HlPerp.nextFundingTime` was 02:00 for every coin (true next:
+  03:00). Ground truth is HL's own hourly `fundingHistory` plus the clock, not the
+  other venues. The next HL settlement is therefore computed as the next whole
+  hour. Cause unknown. (`BinPerp`/`BybitPerp` showed future times consistent with
+  an 8h 00/08/16 UTC grid, but were not checked against Binance/Bybit's own APIs;
+  the tool does not use their `nextFundingTime`.)
+
+**Sign conventions (verified live 2026-10-06):**
+- Funding rate: **positive = longs pay shorts** (HL docs; consistent with the
+  `userFunding` ledger deltas below).
+- **`clearinghouseState.cumFunding` is positive when the position PAID funding**
+  (it is a cost: the negation of the `userFunding` ledger's `usdc` cash flow).
+  Checked 8 long positions (2 curated wallets) with a positive current rate: each
+  latest `userFunding` delta had `usdc < 0` (cash paid), while
+  `cumFunding.sinceChange` was **positive** on all 8. Shorts confirm the other
+  direction: an ETH short received `usdc = +26.230339` in its one settlement since
+  the last size change and showed `sinceChange = -26.230339` exactly. The
+  `CumFunding` docstring in `schemas/hl_api.py` originally said the opposite and
+  has been corrected. `funding_carry` defines its own convention (+ = that side
+  receives) and does not depend on `cumFunding`.
+
 ## Doc references
 
 - Info endpoint (l2Book, candleSnapshot, symbol notation):
