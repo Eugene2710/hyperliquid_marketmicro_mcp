@@ -19,10 +19,12 @@ from fastmcp import FastMCP
 
 from hlmcp.config import load_config
 from hlmcp.schemas.responses import (
+    FundingCarryResponse,
     ListHip3DexesResponse,
     OrderBookImbalanceResponse,
     WhalePositionMonitorResponse,
 )
+from hlmcp.tools.funding_carry import DEFAULT_LOOKBACK_HOURS, compute_funding_carry
 from hlmcp.tools.list_hip3_dexes import compute_list_hip3_dexes
 from hlmcp.tools.order_book_imbalance import DEFAULT_BANDS_BPS, compute_order_book_imbalance
 from hlmcp.tools.whale_position_monitor import compute_whale_positions, load_curated_whales
@@ -189,6 +191,50 @@ async def list_hip3_dexes() -> ListHip3DexesResponse:
         no server timestamp, so freshness reflects local fetch time only.
     """
     return await compute_list_hip3_dexes(_require_venue())
+
+
+@mcp.tool
+async def funding_carry(
+    coin: str,
+    lookback_hours: int | None = None,
+) -> FundingCarryResponse:
+    """Funding rate and carry for ONE Hyperliquid perp: what it costs (or pays) to hold.
+
+    Use this for funding / carry / "cost to hold" questions: what is the funding
+    rate on a coin, is it positive or negative, is it profitable to hold a long
+    or short perp, and how does HL's funding compare with Binance/Bybit. It does
+    NOT measure order-book buying/selling pressure; that is
+    ``order_book_imbalance``. A question asking about both (e.g. "is funding
+    positive and is the book bid-heavy?") needs both tools.
+
+    Reports: the CURRENT predicted hourly rate (annualized), premium,
+    mark-vs-oracle basis and open interest; annualized carry for a long and for a
+    short at that rate (positive = that side RECEIVES funding, negative = it
+    PAYS); REALIZED funding settled over the lookback (mean, cumulative, min/max,
+    share of hours positive); the next hourly settlement time; and, for native
+    coins only, HL vs Binance vs Bybit predicted rates normalized per hour (each
+    venue quotes per its own interval). HL convention: positive funding = longs
+    pay shorts. Annualization is simple (hourly x 8760, no compounding), and the
+    carry is a run-rate at the current rate, not a forecast.
+
+    Data age: the live rate/premium block is an HL REST snapshot (~500ms stale)
+    with no server timestamp, so ``freshness`` is anchored on the newest SETTLED
+    funding row; ``freshness.staleness_ms`` up to ~1h is normal. Research and
+    slow-loop grade, NOT HFT.
+
+    Args:
+        coin: Perp symbol exactly as HL lists it (case-sensitive), e.g. ``"BTC"``,
+            ``"kPEPE"``, or a dex-prefixed HIP-3 market such as ``"xyz:XYZ100"``.
+            Unknown or delisted symbols raise an error.
+        lookback_hours: Realized-funding window in hours, 1 to 720. Defaults to
+            168 (7 days) when omitted.
+
+    Returns:
+        A :class:`FundingCarryResponse`: current funding, carry by side, realized
+        stats, cross-venue comparison (``None`` for HIP-3), and freshness.
+    """
+    hours: int = lookback_hours if lookback_hours is not None else DEFAULT_LOOKBACK_HOURS
+    return await compute_funding_carry(_require_venue(), coin, hours)
 
 
 def main() -> None:
