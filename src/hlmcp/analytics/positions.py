@@ -66,11 +66,13 @@ class PositionSummary(BaseModel):
         "Supplementary for cross margin — see AccountRisk for the real trigger.",
     )
     funding_since_open_usd: float = Field(
-        description="Cumulative funding since open, USD (sign per HL's cumFunding convention)."
+        description="Cumulative funding since open, USD; positive = PAID (a cost), "
+        "negative = received (HL's cumFunding sign)."
     )
     funding_yield: float | None = Field(
         default=None,
-        description="funding_since_open_usd / notional_usd; None when notional is zero.",
+        description="funding_since_open_usd / notional_usd; positive = funding PAID as a "
+        "fraction of notional (a cost), negative = received; None when notional is zero.",
     )
 
 
