@@ -23,7 +23,13 @@ import pytest
 import respx
 
 from hlmcp.config import HLConfig
-from hlmcp.schemas.hl_api import HLClearinghouseState, HLL2Book, HLPerpDexs
+from hlmcp.schemas.hl_api import (
+    HLClearinghouseState,
+    HLL2Book,
+    HLMetaAndAssetCtxs,
+    HLPerpDexs,
+    HLPredictedFundings,
+)
 from hlmcp.venues.errors import HLAPIError
 from hlmcp.venues.hyperliquid import (
     _MAX_ATTEMPTS,
@@ -67,6 +73,9 @@ def _dispatcher(
     perpdexs: Any = None,
     clearinghouse: Any = None,
     l2book: Any = None,
+    meta_ctxs: Any = None,
+    funding_pages: list[Any] | None = None,
+    predicted: Any = None,
     errors: dict[str, tuple[int, str]] | None = None,
     seen: list[dict[str, Any]] | None = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
@@ -76,6 +85,10 @@ def _dispatcher(
         perpdexs: JSON to return for a ``perpDexs`` request.
         clearinghouse: JSON to return for a ``clearinghouseState`` request.
         l2book: JSON to return for an ``l2Book`` request.
+        meta_ctxs: JSON to return for a ``metaAndAssetCtxs`` request.
+        funding_pages: Successive JSON pages for ``fundingHistory`` requests,
+            consumed in order (one per request), to exercise pagination.
+        predicted: JSON to return for a ``predictedFundings`` request.
         errors: Optional map of request ``type`` -> ``(status, body)`` to return
             an error instead of the success payload for that type.
         seen: Optional list that every decoded request payload is appended to, so
@@ -100,6 +113,12 @@ def _dispatcher(
             return httpx.Response(200, json=clearinghouse)
         if req_type == "l2Book":
             return httpx.Response(200, json=l2book)
+        if req_type == "metaAndAssetCtxs":
+            return httpx.Response(200, json=meta_ctxs)
+        if req_type == "fundingHistory" and funding_pages:
+            return httpx.Response(200, json=funding_pages.pop(0))
+        if req_type == "predictedFundings":
+            return httpx.Response(200, json=predicted)
         return httpx.Response(500, text="")
 
     return handler
@@ -455,6 +474,115 @@ async def test_fetch_l2_book_without_params_omits_aggregation(
 
     l2_calls = [p for p in seen if p["type"] == "l2Book"]
     assert set(l2_calls[0]) == {"type", "coin"}
+
+
+# --------------------------------------------------------------------------- #
+# Funding endpoints                                                           #
+# --------------------------------------------------------------------------- #
+
+_HOUR_MS: int = 3_600_000
+
+
+def _funding_rows(start_ms: int, n: int) -> list[dict[str, Any]]:
+    """Build ``n`` hourly fundingHistory rows starting at ``start_ms``."""
+    return [
+        {
+            "coin": "BTC",
+            "fundingRate": "0.0000125",
+            "premium": "0.0",
+            "time": start_ms + i * _HOUR_MS,
+        }
+        for i in range(n)
+    ]
+
+
+async def test_fetch_meta_and_asset_ctxs_sends_dex_and_parses(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """The dex is validated, sent in the body, and the response parses."""
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(
+            perpdexs=load_json("perpdexs.json"),
+            meta_ctxs=load_json("meta_and_asset_ctxs_xyz.json"),
+            seen=seen,
+        )
+    )
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        resp: HLMetaAndAssetCtxs = await venue.fetch_meta_and_asset_ctxs("xyz")
+
+    assert resp.ctx_for("xyz:XYZ100") is not None
+    calls = [p for p in seen if p["type"] == "metaAndAssetCtxs"]
+    assert calls == [{"type": "metaAndAssetCtxs", "dex": "xyz"}]
+
+
+async def test_meta_and_asset_ctxs_unknown_dex_raises_before_network(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """An unknown dex raises ValueError; no metaAndAssetCtxs request goes out."""
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(perpdexs=load_json("perpdexs.json"), seen=seen)
+    )
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        with pytest.raises(ValueError, match="dex"):
+            await venue.fetch_meta_and_asset_ctxs("does-not-exist")
+    assert all(p["type"] != "metaAndAssetCtxs" for p in seen)
+
+
+async def test_funding_history_pages_full_page_then_short(respx_mock: respx.MockRouter) -> None:
+    """A full 500-row page triggers one more request from last time + 1; a short page stops."""
+    start: int = 1_000 * _HOUR_MS
+    end: int = start + 720 * _HOUR_MS
+    page1 = _funding_rows(start, 500)
+    page2 = _funding_rows(start + 500 * _HOUR_MS, 220)
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(side_effect=_dispatcher(funding_pages=[page1, page2], seen=seen))
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        rows = await venue.fetch_funding_history("BTC", start, end)
+
+    assert len(rows) == 720
+    assert [r.time for r in rows] == sorted(r.time for r in rows)
+    assert len(seen) == 2
+    assert seen[0] == {"type": "fundingHistory", "coin": "BTC", "startTime": start, "endTime": end}
+    assert seen[1]["startTime"] == page1[-1]["time"] + 1
+    assert seen[1]["endTime"] == end
+
+
+async def test_funding_history_single_short_page(respx_mock: respx.MockRouter) -> None:
+    """A page under 500 rows is the whole window: exactly one request."""
+    start: int = 1_000 * _HOUR_MS
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(funding_pages=[_funding_rows(start, 168)], seen=seen)
+    )
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        rows = await venue.fetch_funding_history("BTC", start, start + 168 * _HOUR_MS)
+
+    assert len(rows) == 168
+    assert len(seen) == 1
+
+
+async def test_funding_history_rejects_inverted_window() -> None:
+    """start_ms > end_ms raises before any request."""
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        with pytest.raises(ValueError, match="start_ms"):
+            await venue.fetch_funding_history("BTC", 2, 1)
+
+
+async def test_fetch_predicted_fundings_parses(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """predictedFundings sends only the type and parses to HLPredictedFundings."""
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(predicted=load_json("predicted_fundings.json"), seen=seen)
+    )
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        resp: HLPredictedFundings = await venue.fetch_predicted_fundings()
+
+    assert resp.for_coin("BTC") is not None
+    assert seen == [{"type": "predictedFundings"}]
 
 
 # --------------------------------------------------------------------------- #

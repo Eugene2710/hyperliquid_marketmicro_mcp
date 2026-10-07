@@ -44,7 +44,14 @@ from tenacity import (
 from hlmcp.analytics.aggregation import L2BookParams
 from hlmcp.analytics.utils import normalize_wallet
 from hlmcp.config import HLConfig
-from hlmcp.schemas.hl_api import HLClearinghouseState, HLL2Book, HLPerpDexs
+from hlmcp.schemas.hl_api import (
+    HLClearinghouseState,
+    HLFundingHistoryEntry,
+    HLL2Book,
+    HLMetaAndAssetCtxs,
+    HLPerpDexs,
+    HLPredictedFundings,
+)
 from hlmcp.venues.errors import HLAPIError
 
 # The empty-string dex key targets native HL perps; HL treats an omitted ``dex``
@@ -62,6 +69,11 @@ NATIVE_HL_DEX: str = ""
 _MAX_ATTEMPTS: int = 3  # total attempts = the original try plus 2 retries
 _RETRY_INITIAL_WAIT_S: float = 0.25  # first backoff; then exponential with jitter
 _RETRY_MAX_WAIT_S: float = 2.0  # per-wait cap so an outage cannot amplify load
+
+# ``fundingHistory`` returns at most this many rows per response, oldest-first
+# from ``startTime`` (api_spike_findings.md, Funding: a 60-day request returned
+# exactly the oldest 500 hourly rows). A full page means "there may be more".
+_FUNDING_HISTORY_PAGE: int = 500
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -546,3 +558,87 @@ class HyperliquidPublic:
             payload.update(params)
         raw: Any = await self._post(payload)
         return HLL2Book.model_validate(raw)
+
+    async def fetch_meta_and_asset_ctxs(self, dex: str = NATIVE_HL_DEX) -> HLMetaAndAssetCtxs:
+        """
+        Fetch one dex's market universe and live per-asset context.
+
+        Mechanism: validate the dex client-side -> POST ``metaAndAssetCtxs`` ->
+        parse into class ``HLMetaAndAssetCtxs``. The ctx carries the predicted
+        hourly funding rate, premium, mark/oracle/mid prices and open interest.
+
+        Note: the response has NO server timestamp.
+
+        Args:
+            dex: Dex name. "" (default) targets native HL; a HIP-3 name (e.g.
+            ``"xyz"``) targets that deployment. Validated before the request.
+
+        Returns:
+            Parsed class ``HLMetaAndAssetCtxs``.
+
+        Raises:
+            ValueError: If ``dex`` is unknown (raised before any network call).
+            HLAPIError: On an API-level error.
+        """
+        await self._validate_dex(dex)
+        raw: Any = await self._post({"type": "metaAndAssetCtxs", "dex": dex})
+        return HLMetaAndAssetCtxs.model_validate(raw)
+
+    async def fetch_funding_history(
+        self, coin: str, start_ms: int, end_ms: int
+    ) -> list[HLFundingHistoryEntry]:
+        """
+        Fetch every hourly funding settlement for ``coin`` in ``[start_ms, end_ms]``.
+
+        Mechanism: POST ``fundingHistory`` from ``start_ms``; while a page comes
+        back full (``_FUNDING_HISTORY_PAGE`` rows) and has not reached ``end_ms``,
+        re-request from the last row's time + 1. Pages are concatenated
+        oldest-first.
+
+        Caution: an unknown coin returns HTTP 500 with a ``null`` body, which the
+        retry policy treats as transient. Callers should check the coin against
+        ``fetch_meta_and_asset_ctxs`` first.
+
+        Args:
+            coin: Symbol, e.g. ``"BTC"`` or ``"xyz:XYZ100"`` (HIP-3).
+            start_ms: Window start, ms since epoch (inclusive).
+            end_ms: Window end, ms since epoch (inclusive).
+
+        Returns:
+            Settlements in the window, oldest first; empty if there are none.
+
+        Raises:
+            ValueError: If ``start_ms > end_ms``.
+            HLAPIError: On an API-level error (e.g. an unknown coin).
+        """
+        if start_ms > end_ms:
+            raise ValueError(f"start_ms ({start_ms}) must be <= end_ms ({end_ms})")
+        entries: list[HLFundingHistoryEntry] = []
+        cursor: int = start_ms
+        while True:
+            raw: Any = await self._post(
+                {"type": "fundingHistory", "coin": coin, "startTime": cursor, "endTime": end_ms}
+            )
+            page: list[HLFundingHistoryEntry] = [
+                HLFundingHistoryEntry.model_validate(row) for row in raw
+            ]
+            entries.extend(page)
+            if len(page) < _FUNDING_HISTORY_PAGE or page[-1].time >= end_ms:
+                return entries
+            cursor = page[-1].time + 1
+
+    async def fetch_predicted_fundings(self) -> HLPredictedFundings:
+        """
+        Fetch predicted funding across HL, Binance and Bybit for native coins.
+
+        Mechanism: POST ``predictedFundings`` -> parse into class
+        ``HLPredictedFundings``. HIP-3 coins are not covered.
+
+        Returns:
+            Parsed class ``HLPredictedFundings``.
+
+        Raises:
+            HLAPIError: On an API-level error.
+        """
+        raw: Any = await self._post({"type": "predictedFundings"})
+        return HLPredictedFundings.model_validate(raw)
