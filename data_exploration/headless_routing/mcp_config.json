@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "hlmcp": {
+      "command": "/Users/eugeneleejunping/mcp_hl_market_microstructure_and_execution/.venv/bin/hlmcp-server",
+      "args": [],
+      "env": {
+        "PYTHONPATH": "/Users/eugeneleejunping/mcp_hl_market_microstructure_and_execution/src"
+      }
+    }
+  }
+}
