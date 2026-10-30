@@ -97,3 +97,93 @@ one line per case in `results/manual-YYYY-MM-DD.jsonl`:
 `"observed_tool": null` means no tool was called. Then `--score` that file.
 Cases with no observation are listed and excluded from the denominator, so a
 partial run reports honestly rather than scoring itself against missing data.
+
+## Headless routing runner — spike findings
+
+Can Claude Code headless mode (`claude -p`, on the subscription) replace hand
+runs in Claude Desktop for the tool_selection eval? Measured on 2026-10-29/30,
+Claude Code 2.1.312, macOS. Probe script and MCP config:
+`data_exploration/headless_routing/`. Raw transcripts:
+`tests/fixtures/headless_routing/`.
+
+**[measured]** = observed in a pasted run; **[derived]** = follows from a
+measurement by an explicit rule; **[estimate]** = a reasoned guess not yet
+validated (same convention as `docs/architecture.md`).
+
+Status: questions 1–2 answered; 3–7 pending.
+
+### 1. Billing — subscription, not API key: **GO**
+
+- **[measured]** No API key in the environment or settings:
+
+  ```text
+  $ if [ -n "${ANTHROPIC_API_KEY+x}" ]; then echo SET; else echo unset; fi
+  unset
+  $ env | cut -d= -f1 | grep -E '^(ANTHROPIC_|CLAUDE_CODE_|AWS_BEARER|CLAUDE_|VERTEX)'
+  CLAUDE_CODE_CHILD_SESSION  CLAUDE_CODE_ENTRYPOINT  CLAUDE_CODE_EXECPATH
+  CLAUDE_CODE_MESSAGING_SOCKET  CLAUDE_CODE_MESSAGING_TOKEN
+  CLAUDE_CODE_SESSION_ATTENDED  CLAUDE_CODE_SESSION_ID  CLAUDE_CODE_SSE_PORT
+  CLAUDE_EFFORT  CLAUDE_PID
+  ```
+
+  No `apiKeyHelper` / `ANTHROPIC_API_KEY` / `primaryApiKey` in
+  `~/.claude/settings.json` or `~/.claude.json`; no managed or project
+  settings files exist.
+- **[measured]** `claude auth status --json` (identifiers omitted):
+  `loggedIn: true, authMethod: "claude.ai", apiProvider: "firstParty",
+  subscriptionType: "max"`.
+- **[measured]** What `-p` actually used: the stream-json `system/init` event
+  reports `"apiKeySource": "none"` (OAuth subscription login), both with the
+  inherited environment and under `env -i HOME USER PATH TERM`.
+- **[measured]** Overage cannot bill: every transcript carries a
+  `rate_limit_event` with `"overageStatus": "rejected",
+  "overageDisabledReason": "org_level_disabled", "isUsingOverage": false`.
+  Exhausting the plan allowance rate-limits the runner; it does not charge.
+- **[measured]** `--bare` is unusable: `claude --help` says its auth is
+  "strictly ANTHROPIC_API_KEY or apiKeyHelper via --settings (OAuth and
+  keychain are never read)".
+- **[derived]** `result.total_cost_usd` (0.0179 for a one-word reply) is
+  reported even on subscription auth, so it is a notional API-rate figure, not
+  a charge. Use `rate_limit_event` utilization and wall time instead.
+
+### 2. Observability — tool name and full args visible: **GO**
+
+- **[measured]** With `--output-format stream-json --verbose`, each attempted
+  call appears in **three** places, all with the prefixed tool name:
+  1. an `assistant` event whose `message.content[]` holds a `tool_use` block
+     (`name`, `input`, `id`);
+  2. a `system` event with `subtype: "permission_denied"` (`tool_name`,
+     `tool_use_id`; when the call was denied);
+  3. the final `result` event's `permission_denials[]` (`tool_name`,
+     `tool_use_id`, `tool_input`).
+- **[measured]** Args are verbatim, including nested values (sel-004):
+
+  ```text
+  {"name": "mcp__hlmcp__whale_position_monitor",
+   "input": {"wallets": ["0xe09726ff25f5001f37b15049f54116cb83d7d0fe"],
+             "include_hip3": true}}
+  ```
+
+- **[measured]** Tool names carry the MCP prefix `mcp__hlmcp__<tool>` (the
+  server key in the MCP config is `hlmcp`); a parser must strip it.
+- **[measured]** Event shape gotcha for the parser: `message` is an object on
+  `assistant`/`user` events but a **string** on `system/permission_denied`.
+- Fixtures (sonnet-5/high, hlmcp tools not pre-approved, one per tool):
+
+  | File | Prompt (case) | `tool_use` |
+  |---|---|---|
+  | `funding_carry_denied.jsonl` | sel-012 | `funding_carry {"coin": "BTC"}` |
+  | `order_book_imbalance_denied.jsonl` | sel-001 | `order_book_imbalance {"coin": "BTC"}` |
+  | `whale_position_monitor_denied.jsonl` | sel-003 | `whale_position_monitor {}` |
+  | `whale_position_monitor_args_denied.jsonl` | sel-004 | wallets + `include_hip3` (above) |
+  | `list_hip3_dexes_denied.jsonl` | sel-005 | `list_hip3_dexes {}` |
+
+  The fixtures are unredacted, as the brief requires. They contain local
+  paths (`cwd`, `memory_paths`) and session ids, but no account identifiers
+  (checked with a grep for the email, `orgId` and `orgName`).
+
+### 3–7. Pending
+
+Early observation for question 3, not yet a finding: in all 5 fixture runs the
+denied call was followed by a text-only answer asking for permission. There
+was no retry and no second tool (`num_turns: 2`).
