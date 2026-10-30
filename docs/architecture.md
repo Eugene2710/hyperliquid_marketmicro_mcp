@@ -70,7 +70,7 @@ flowchart TD
 ```
 
 A single tool call flows through the layers like this (using
-`order_book_imbalance`; the other two follow the same shape):
+`order_book_imbalance`; the other three follow the same shape):
 
 ```mermaid
 sequenceDiagram
