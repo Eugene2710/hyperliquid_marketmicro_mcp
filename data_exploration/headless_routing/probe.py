@@ -74,12 +74,19 @@ def build_mcp_config(repo_root: Path) -> dict[str, Any]:
     }
 
 
-def run_probe(prompt: str, out: Path, model: str, effort: str, extra: list[str]) -> float:
+def run_probe(
+    prompt: str,
+    out: Path,
+    model: str,
+    effort: str,
+    extra: list[str],
+    cwd: Path | None = None,
+) -> float:
     """Run one prompt through ``claude -p`` and save the raw transcript.
 
     Mechanism: takes a prompt and flags, writes the MCP config to its own temp
-    dir, runs ``claude`` with a scrubbed env in a separate, empty temp cwd, writes
-    stdout verbatim to ``out``, returns wall time.
+    dir, runs ``claude`` with a scrubbed env in ``cwd`` (or a fresh empty temp
+    dir), writes stdout verbatim to ``out``, returns wall time.
 
     Args:
         prompt: The user prompt to send.
@@ -87,6 +94,8 @@ def run_probe(prompt: str, out: Path, model: str, effort: str, extra: list[str])
         model: Value for ``--model``.
         effort: Value for ``--effort``.
         extra: Additional ``claude`` arguments appended after the base flags.
+        cwd: Working directory to run in; must be empty for isolation. ``None``
+            creates a fresh temp dir per call.
 
     Returns:
         Wall-clock seconds the ``claude`` process took.
@@ -97,8 +106,9 @@ def run_probe(prompt: str, out: Path, model: str, effort: str, extra: list[str])
     env: dict[str, str] = {k: os.environ[k] for k in KEPT_ENV if k in os.environ}
     with (
         tempfile.TemporaryDirectory(prefix="hl-mcp-config-") as config_dir,
-        tempfile.TemporaryDirectory(prefix="hl-headless-") as cwd,
+        tempfile.TemporaryDirectory(prefix="hl-headless-") as temp_cwd,
     ):
+        run_cwd: str = str(cwd) if cwd is not None else temp_cwd
         config: Path = Path(config_dir) / "mcp_config.json"
         config.write_text(json.dumps(build_mcp_config(REPO_ROOT)))
         cmd: list[str] = [
@@ -115,7 +125,7 @@ def run_probe(prompt: str, out: Path, model: str, effort: str, extra: list[str])
         ]
         start: float = time.monotonic()
         proc: subprocess.CompletedProcess[str] = subprocess.run(
-            cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=300, check=False
+            cmd, cwd=run_cwd, env=env, capture_output=True, text=True, timeout=300, check=False
         )
         elapsed: float = time.monotonic() - start
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -151,6 +161,11 @@ def summarize(transcript: Path) -> None:
             print(f"init: tools={event.get('tools')}")
             print(f"init: mcp_servers={event.get('mcp_servers')}")
             print(f"init: memory_paths={event.get('memory_paths')}")
+            counts: dict[str, int] = {
+                key: len(event.get(key) or [])
+                for key in ("skills", "slash_commands", "plugins", "agents")
+            }
+            print(f"init: counts={counts}")
         elif etype in ("assistant", "user"):
             message: Any = event.get("message", {})
             msg_id: str = str(message.get("id", ""))[-8:]
@@ -169,6 +184,14 @@ def summarize(transcript: Path) -> None:
             print(f"result: is_error={event.get('is_error')} num_turns={event.get('num_turns')}")
             print(f"result: permission_denials={event.get('permission_denials')}")
             print(f"result: duration_ms={event.get('duration_ms')} usage={event.get('usage')}")
+            # Total prompt size of the first model request: a proxy for how much
+            # context (system prompt, skills, tool schemas) the harness injected.
+            first: dict[str, Any] = ((event.get("usage") or {}).get("iterations") or [{}])[0]
+            prompt_tokens: int = sum(
+                int(first.get(k) or 0)
+                for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+            )
+            print(f"result: first_request_prompt_tokens={prompt_tokens}")
 
 
 def main() -> None:
