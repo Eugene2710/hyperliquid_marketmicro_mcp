@@ -28,8 +28,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-# Absolute path of the hlmcp-only MCP config next to this script.
-MCP_CONFIG: Path = Path(__file__).resolve().parent / "mcp_config.json"
+# Repo root (this file is data_exploration/headless_routing/probe.py); the MCP
+# config is generated from it so no machine-specific path is checked in.
+REPO_ROOT: Path = Path(__file__).resolve().parents[2]
 
 # The only variables passed to the child. The parent Claude Code session exports
 # CLAUDE_EFFORT and CLAUDE_CODE_* variables that would otherwise leak in.
@@ -43,19 +44,42 @@ BASE_ARGS: list[str] = [
     "stream-json",
     "--verbose",
     "--strict-mcp-config",
-    "--mcp-config",
-    str(MCP_CONFIG),
     "--tools",
     "",
     "--no-session-persistence",
 ]
 
 
+def build_mcp_config(repo_root: Path) -> dict[str, Any]:
+    """Build the hlmcp-only MCP config for a checkout of this repo.
+
+    Mechanism: takes the repo root, returns a config that launches the venv's
+    ``hlmcp-server`` console script with ``PYTHONPATH=<repo>/src`` (so it does not
+    depend on the editable-install ``.pth``).
+
+    Args:
+        repo_root: Root of the hlmcp checkout.
+
+    Returns:
+        The config as a dict, ready to be written as JSON for ``--mcp-config``.
+    """
+    return {
+        "mcpServers": {
+            "hlmcp": {
+                "command": str(repo_root / ".venv" / "bin" / "hlmcp-server"),
+                "args": [],
+                "env": {"PYTHONPATH": str(repo_root / "src")},
+            }
+        }
+    }
+
+
 def run_probe(prompt: str, out: Path, model: str, effort: str, extra: list[str]) -> float:
     """Run one prompt through ``claude -p`` and save the raw transcript.
 
-    Mechanism: takes a prompt and flags, runs ``claude`` with a scrubbed env in
-    a fresh empty temp dir, writes stdout verbatim to ``out``, returns wall time.
+    Mechanism: takes a prompt and flags, writes the MCP config to its own temp
+    dir, runs ``claude`` with a scrubbed env in a separate, empty temp cwd, writes
+    stdout verbatim to ``out``, returns wall time.
 
     Args:
         prompt: The user prompt to send.
@@ -71,8 +95,24 @@ def run_probe(prompt: str, out: Path, model: str, effort: str, extra: list[str])
         subprocess.TimeoutExpired: If the process runs longer than 300 s.
     """
     env: dict[str, str] = {k: os.environ[k] for k in KEPT_ENV if k in os.environ}
-    cmd: list[str] = ["claude", *BASE_ARGS, "--model", model, "--effort", effort, *extra, prompt]
-    with tempfile.TemporaryDirectory(prefix="hl-headless-") as cwd:
+    with (
+        tempfile.TemporaryDirectory(prefix="hl-mcp-config-") as config_dir,
+        tempfile.TemporaryDirectory(prefix="hl-headless-") as cwd,
+    ):
+        config: Path = Path(config_dir) / "mcp_config.json"
+        config.write_text(json.dumps(build_mcp_config(REPO_ROOT)))
+        cmd: list[str] = [
+            "claude",
+            *BASE_ARGS,
+            "--mcp-config",
+            str(config),
+            "--model",
+            model,
+            "--effort",
+            effort,
+            *extra,
+            prompt,
+        ]
         start: float = time.monotonic()
         proc: subprocess.CompletedProcess[str] = subprocess.run(
             cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=300, check=False
@@ -112,11 +152,14 @@ def summarize(transcript: Path) -> None:
             print(f"init: mcp_servers={event.get('mcp_servers')}")
             print(f"init: memory_paths={event.get('memory_paths')}")
         elif etype in ("assistant", "user"):
-            content: Any = event.get("message", {}).get("content", [])
+            message: Any = event.get("message", {})
+            msg_id: str = str(message.get("id", ""))[-8:]
+            content: Any = message.get("content", [])
             for block in content if isinstance(content, list) else []:
                 kind: str = str(block.get("type"))
                 if kind == "tool_use":
-                    print(f"{etype}: tool_use name={block.get('name')} input={block.get('input')}")
+                    name: Any = block.get("name")
+                    print(f"{etype}[{msg_id}]: tool_use name={name} input={block.get('input')}")
                 elif kind == "tool_result":
                     body: str = json.dumps(block.get("content"))[:160]
                     print(f"{etype}: tool_result is_error={block.get('is_error')} {body}")
