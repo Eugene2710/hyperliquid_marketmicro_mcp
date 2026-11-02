@@ -10,6 +10,10 @@ keeps its value: event types, ``tool_use`` blocks and their ids, ``message.id``,
 
 Idempotent: scrubbing an already-scrubbed file changes nothing.
 
+Refuses (raises, writes nothing) if a transcript contains an email address.
+Claude Code injects the account email into every run's context, so a model
+reply can echo it; that must be caught, not silently committed.
+
 Usage::
 
     uv run python data_exploration/headless_routing/scrub.py tests/fixtures/headless_routing/*.jsonl
@@ -41,6 +45,10 @@ INIT_REPLACEMENTS: dict[str, Any] = {
 # macOS per-user temp roots look like /private/var/folders/<2 chars>/<id>/T or /var/folders/...
 TMPDIR_RE: re.Pattern[str] = re.compile(r"(/private)?/var/folders/[^/\"]+/[^/\"]+/T")
 
+# Anything shaped like an email address. Deliberately broad: a false positive
+# only means a human looks at the file before committing it.
+EMAIL_RE: re.Pattern[str] = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
 
 def scrub_event(event: dict[str, Any], home: str) -> dict[str, Any]:
     """Return a copy of one transcript event with machine-specific data removed.
@@ -71,8 +79,9 @@ def scrub_event(event: dict[str, Any], home: str) -> dict[str, Any]:
 def scrub_file(path: Path, home: str) -> bool:
     """Scrub one transcript file in place.
 
-    Mechanism: takes a JSONL path, scrubs every event with :func:`scrub_event`,
-    rewrites the file only if something changed, returns whether it did.
+    Mechanism: takes a JSONL path, refuses it if any line contains an email
+    address, scrubs every event with :func:`scrub_event`, rewrites the file only
+    if something changed, returns whether it did.
 
     Args:
         path: Transcript file (one JSON event per line).
@@ -83,8 +92,12 @@ def scrub_file(path: Path, home: str) -> bool:
 
     Raises:
         json.JSONDecodeError: If a line is not valid JSON.
+        ValueError: If the file contains an email address (nothing is written).
     """
     original: str = path.read_text()
+    for number, raw in enumerate(original.splitlines(), start=1):
+        if EMAIL_RE.search(raw):
+            raise ValueError(f"{path}:{number}: contains an email address; remove it by hand")
     lines: list[str] = [
         json.dumps(scrub_event(json.loads(raw), home), ensure_ascii=False, separators=(",", ":"))
         for raw in original.splitlines()
