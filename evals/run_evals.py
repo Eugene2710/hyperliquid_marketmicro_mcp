@@ -11,9 +11,13 @@ Three modes, in increasing cost:
     assertions. Needs network. **Costs nothing** — the tools are called
     directly, so no LLM is involved anywhere in this path.
 
-``--score <results.jsonl>``
-    Score a ``tool_selection`` run: join hand-recorded (or later, API-recorded)
-    observations to the cases and report routing accuracy. No network.
+``--score <results.jsonl> [<results.jsonl> ...]``
+    Score ``tool_selection`` runs: join hand-recorded (or headless-recorded)
+    observations to the cases and report routing accuracy. One file reports
+    per-case pass/fail; several files are treated as repeats of the same
+    dataset and report per-case stable pass / flaky / stable fail.
+    ``--gate-only`` restricts scoring to the cases marked ``"gate": true``.
+    No network.
 
 The grading logic itself lives in :mod:`evals.grader` — pure functions, unit
 tested offline. This module owns only I/O: reading datasets, calling tools,
@@ -31,6 +35,7 @@ Usage::
     uv run python evals/run_evals.py --type tool_selection
     uv run python evals/run_evals.py --run-output
     uv run python evals/run_evals.py --score evals/results/manual-2026-08-14.jsonl
+    uv run python evals/run_evals.py --score r1.jsonl r2.jsonl r3.jsonl --gate-only
 """
 
 from __future__ import annotations
@@ -58,8 +63,11 @@ from evals.grader import (  # noqa: E402 - must follow the sys.path bootstrap
     Observation,
     OutputCaseResult,
     SelectionCaseResult,
+    expected_tools_of,
     grade_output_case,
     grade_selection_case,
+    model_warnings,
+    summarize_repeats,
 )
 from hlmcp.config import load_config  # noqa: E402
 from hlmcp.server import mcp  # noqa: E402
@@ -147,10 +155,13 @@ def _validate_tool_selection(cases: list[tuple[int, dict[str, Any]]]) -> list[st
     Mechanism: takes the loaded cases, checks each against the documented
     schema, returns the problems found.
 
-    Required: ``id`` (str), ``prompt`` (str), ``expected_tool`` (a registered
-    tool name **or ``null``** — ``null`` marks a *negative* case, where calling
-    no tool is the correct behaviour). ``expected_args`` is optional and, if
-    present, must be an object.
+    Required: ``id`` (str), ``prompt`` (str), and exactly one of
+    ``expected_tool`` (a registered tool name **or ``null``** — ``null`` marks
+    a *negative* case, where calling no tool is the correct behaviour) or
+    ``expected_tools`` (2+ distinct registered names, all of which must be
+    called). ``expected_args`` is optional and, if present, must be an object;
+    for an ``expected_tools`` case it is keyed by tool name, each value an
+    object. ``gate`` is optional and, if present, must be a bool.
 
     Args:
         cases: ``(line number, case)`` pairs from the dataset.
@@ -171,16 +182,27 @@ def _validate_tool_selection(cases: list[tuple[int, dict[str, Any]]]) -> list[st
         seen_ids.add(case_id)
         if not isinstance(case.get("prompt"), str) or not case["prompt"]:
             errors.append(f"{case_id}: missing/empty string 'prompt'")
-        if "expected_tool" not in case:
-            errors.append(f"{case_id}: missing 'expected_tool' (use null for a negative case)")
-        else:
-            expected_tool = case["expected_tool"]
-            if expected_tool is not None and expected_tool not in known:
-                errors.append(
-                    f"{case_id}: 'expected_tool' {expected_tool!r} is not a registered tool"
-                )
-        if "expected_args" in case and not isinstance(case["expected_args"], dict):
-            errors.append(f"{case_id}: 'expected_args' must be an object when present")
+        try:
+            expected_tools = expected_tools_of(case)
+        except ValueError as exc:
+            errors.append(f"{case_id}: {exc}")
+            expected_tools = ()
+        for tool in expected_tools:
+            if tool not in known:
+                errors.append(f"{case_id}: expected tool {tool!r} is not a registered tool")
+        if "expected_args" in case:
+            expected_args = case["expected_args"]
+            if not isinstance(expected_args, dict):
+                errors.append(f"{case_id}: 'expected_args' must be an object when present")
+            elif len(expected_tools) > 1:
+                for tool, per_tool in expected_args.items():
+                    if tool not in expected_tools or not isinstance(per_tool, dict):
+                        errors.append(
+                            f"{case_id}: 'expected_args' of an expected_tools case maps each "
+                            f"expected tool to an object; bad entry {tool!r}"
+                        )
+        if "gate" in case and not isinstance(case["gate"], bool):
+            errors.append(f"{case_id}: 'gate' must be true or false, got {case['gate']!r}")
     return errors
 
 
@@ -191,9 +213,12 @@ def _validate_tool_output(cases: list[tuple[int, dict[str, Any]]]) -> list[str]:
     schema, returns the problems found.
 
     Required: ``id`` (str), ``tool`` (a registered tool name), ``args``
-    (object), ``assertions`` (non-empty list). Each assertion must be an object
-    with a string ``path`` and a ``check`` drawn from
-    :data:`~evals.grader.KNOWN_CHECKS`.
+    (object), and either ``assertions`` (non-empty list) or ``expect_error``
+    (an exception class name; the case then has no assertions, since a raising
+    call returns nothing to assert on). Each assertion must be an object with a
+    string ``path`` and a ``check`` drawn from
+    :data:`~evals.grader.KNOWN_CHECKS`; a ``neg_of`` assertion's ``value`` must
+    be a path string, and its optional ``tolerance`` a non-negative number.
 
     Args:
         cases: ``(line number, case)`` pairs from the dataset.
@@ -216,6 +241,13 @@ def _validate_tool_output(cases: list[tuple[int, dict[str, Any]]]) -> list[str]:
             errors.append(f"{case_id}: 'tool' {case.get('tool')!r} is not a registered tool")
         if not isinstance(case.get("args"), dict):
             errors.append(f"{case_id}: 'args' must be an object")
+        if "expect_error" in case:
+            expect_error = case["expect_error"]
+            if not isinstance(expect_error, str) or not expect_error:
+                errors.append(f"{case_id}: 'expect_error' must be an exception class name")
+            if "assertions" in case:
+                errors.append(f"{case_id}: an expect_error case takes no 'assertions'")
+            continue
         assertions = case.get("assertions")
         if not isinstance(assertions, list) or not assertions:
             errors.append(f"{case_id}: 'assertions' must be a non-empty list")
@@ -230,6 +262,18 @@ def _validate_tool_output(cases: list[tuple[int, dict[str, Any]]]) -> list[str]:
                 errors.append(
                     f"{case_id}: assertion {i} has unknown check {assertion.get('check')!r}"
                 )
+            if assertion.get("check") == "neg_of":
+                if not isinstance(assertion.get("value"), str):
+                    errors.append(f"{case_id}: assertion {i} neg_of 'value' must be a path")
+                tolerance = assertion.get("tolerance", 0)
+                if (
+                    isinstance(tolerance, bool)
+                    or not isinstance(tolerance, (int, float))
+                    or tolerance < 0
+                ):
+                    errors.append(
+                        f"{case_id}: assertion {i} 'tolerance' must be a non-negative number"
+                    )
     return errors
 
 
@@ -322,7 +366,10 @@ async def _run_output_cases(cases: list[dict[str, Any]]) -> list[OutputCaseResul
             try:
                 response = await _call_tool(venue, tool, dict(args or {}))
             except Exception as exc:  # noqa: BLE001 - captured as the case's result
-                results.append(grade_output_case(case, None, error=f"{type(exc).__name__}: {exc}"))
+                name = type(exc).__name__
+                results.append(
+                    grade_output_case(case, None, error=f"{name}: {exc}", error_type=name)
+                )
                 continue
             results.append(grade_output_case(case, response.model_dump()))
     return results
@@ -371,7 +418,9 @@ def report_output(results: list[OutputCaseResult]) -> int:
         mark = "PASS" if result.passed else "FAIL"
         print(f"[{mark}] {result.case_id} ({result.tool})")
         if result.error:
-            print(f"    ! {result.error}")
+            # A passing case with an error is an expect_error case that raised
+            # the expected class: shown as a fact, not as a problem.
+            print(f"    {'ok' if result.passed else '!'} {result.error}")
         for assertion in result.assertions:
             sub = "ok " if assertion.passed else "FAIL"
             print(f"    {sub} {assertion.path} {assertion.check}: {assertion.detail}")
@@ -431,6 +480,104 @@ def report_selection(results: list[SelectionCaseResult], unobserved: list[str]) 
     return 0 if graded and routed == graded else 1
 
 
+def report_repeats(runs: list[list[SelectionCaseResult]], unobserved: list[str]) -> int:
+    """Print a per-case stability report over repeated runs; return the exit code.
+
+    Mechanism: takes one list of graded cases per results file plus the cases
+    no file observed, folds them with :func:`~evals.grader.summarize_repeats`,
+    prints each case's verdict and the totals, returns 0 only if every
+    observed case passed in every run.
+
+    Args:
+        runs: Graded selection cases, one list per results file.
+        unobserved: Case ids no results file observed.
+
+    Returns:
+        ``0`` if every observed case is a stable pass, else ``1``.
+    """
+    print(f"tool_selection — routing stability over {len(runs)} runs\n")
+    summaries = summarize_repeats(runs)
+    labels: dict[str, str] = {
+        "stable pass": "STABLE PASS",
+        "flaky": "FLAKY",
+        "stable fail": "STABLE FAIL",
+    }
+    for summary in summaries:
+        line = (
+            f"[{labels[summary.stability]}] {summary.case_id}: {summary.n_passed}/{summary.n_runs}"
+        )
+        # Distinct failure details only: three identical misroutes say it once.
+        failures = list(dict.fromkeys(summary.failures))
+        print(line + (f" — {' | '.join(failures)}" if failures else ""))
+
+    counts: dict[str, int] = {s: 0 for s in labels}
+    for summary in summaries:
+        counts[summary.stability] += 1
+    print(
+        f"\nstable pass: {counts['stable pass']}, flaky: {counts['flaky']}, "
+        f"stable fail: {counts['stable fail']} (of {len(summaries)} observed cases)"
+    )
+    if unobserved:
+        print(f"\n{len(unobserved)} case(s) not observed in any run, excluded from the score:")
+        for case_id in unobserved:
+            print(f"    - {case_id}")
+    all_stable = bool(summaries) and counts["stable pass"] == len(summaries)
+    if all_stable:
+        print("\nAll observed cases routed correctly in every run.")
+    return 0 if all_stable else 1
+
+
+def score_results(
+    paths: list[Path], cases: list[dict[str, Any]], *, gate_only: bool = False
+) -> int:
+    """Score one or more results files against the selection cases; return the exit code.
+
+    Mechanism: takes results-file paths and the dataset cases, filters to the
+    gate set if asked, grades each file's observations, warns on stderr about
+    missing or mixed ``model`` values, then prints the single-run report for
+    one file or the stability report for several.
+
+    A single file goes through :func:`report_selection` unchanged, so its stdout
+    is exactly what it was before repeats existed. The model warnings go to
+    stderr for the same reason.
+
+    Args:
+        paths: Results files; several are scored as repeats of one dataset.
+        cases: The ``tool_selection`` dataset cases, in dataset order.
+        gate_only: Score only the cases marked ``"gate": true``.
+
+    Returns:
+        The report's exit code.
+
+    Raises:
+        FileNotFoundError: If a results file does not exist.
+        ValueError: If a results row lacks a usable ``id``.
+    """
+    if gate_only:
+        cases = [case for case in cases if case.get("gate") is True]
+    per_file: dict[str, dict[str, Observation]] = {
+        str(path): _load_observations(path) for path in paths
+    }
+    for warning in model_warnings({name: list(obs.values()) for name, obs in per_file.items()}):
+        print(f"warning: {warning}", file=sys.stderr)
+
+    runs: list[list[SelectionCaseResult]] = []
+    observed_ids: set[str] = set()
+    for observations in per_file.values():
+        graded: list[SelectionCaseResult] = []
+        for case in cases:
+            observation = observations.get(str(case.get("id", "")))
+            if observation is not None:
+                graded.append(grade_selection_case(case, observation))
+                observed_ids.add(observation.case_id)
+        runs.append(graded)
+    unobserved = [str(c.get("id", "")) for c in cases if str(c.get("id", "")) not in observed_ids]
+
+    if len(runs) == 1:
+        return report_selection(runs[0], unobserved)
+    return report_repeats(runs, unobserved)
+
+
 def run_validation(datasets: list[str]) -> int:
     """Validate the requested datasets, print a report, and return an exit code.
 
@@ -483,9 +630,18 @@ def main() -> int:
     parser.add_argument(
         "--score",
         metavar="RESULTS.jsonl",
-        help="Score a tool_selection run from a recorded results file.",
+        nargs="+",
+        help="Score tool_selection run(s) from recorded results file(s); several files are "
+        "scored as repeats (stable pass / flaky / stable fail per case).",
+    )
+    parser.add_argument(
+        "--gate-only",
+        action="store_true",
+        help='With --score: score only the cases marked "gate": true.',
     )
     args = parser.parse_args()
+    if args.gate_only and not args.score:
+        parser.error("--gate-only requires --score")
 
     if args.run_output:
         validation = validate_dataset("tool_output")
@@ -498,18 +654,8 @@ def main() -> int:
         return report_output(asyncio.run(_run_output_cases(cases)))
 
     if args.score:
-        observations = _load_observations(Path(args.score))
         cases = [case for _, case in _load_jsonl(_DATASETS_DIR / "tool_selection.jsonl")]
-        graded: list[SelectionCaseResult] = []
-        unobserved: list[str] = []
-        for case in cases:
-            case_id = str(case.get("id", ""))
-            observation = observations.get(case_id)
-            if observation is None:
-                unobserved.append(case_id)
-                continue
-            graded.append(grade_selection_case(case, observation))
-        return report_selection(graded, unobserved)
+        return score_results([Path(p) for p in args.score], cases, gate_only=args.gate_only)
 
     datasets: list[str] = [args.type] if args.type else ["tool_selection", "tool_output"]
     return run_validation(datasets)

@@ -3,494 +3,58 @@
 Everything here is a deterministic function over plain data, so the whole
 grading path is unit-testable with fabricated inputs: no network, no live
 Hyperliquid, no Anthropic API key. The I/O lives in :mod:`evals.run_evals`
-(loading datasets, executing tools, printing reports); this module only decides
+(loading datasets, executing tools, printing reports); these modules only decide
 pass/fail.
 
-Two grading paths, mirroring the two dataset types documented in
-``evals/README.md``:
+This module is the stable import surface. The code lives in one module per
+concern, and every public name is re-exported here so callers import
+``evals.grader`` and never track the split:
 
-- :func:`grade_output_case` — did a tool's response satisfy its assertions?
-  Grades a ``dict`` (a ``model_dump()``-ed response), never a live object, so
-  the caller owns all I/O.
-- :func:`grade_selection_case` — did the model route to the right tool?
-  Grades an :class:`Observation`, which is deliberately agnostic about where it
-  came from: hand-typed into a results file after a Claude Desktop session, or
-  produced later by an API-driven runner. Both yield the same shape, so
-  switching from manual to automated collection never touches this module.
-
-The check vocabulary (``non_empty``, ``gte``, ``lte``, ``eq``, ``in_range``) is
-the v0 convention declared in ``evals/README.md``; :data:`KNOWN_CHECKS` is the
-single source of truth for it.
+- :mod:`evals.observation` — :class:`Observation`, what a model did on one
+  prompt (the results-row contract shared by hand-recorded runs and the
+  headless runner), and the :data:`NO_TOOL` sentinel.
+- :mod:`evals.output_checks` — :func:`grade_output_case`: did a tool's
+  response satisfy its assertions? :data:`KNOWN_CHECKS` is the single source
+  of truth for the check vocabulary declared in ``evals/README.md``.
+- :mod:`evals.selection` — :func:`grade_selection_case`: did the model route
+  to the right tool (or, for ``expected_tools``, all of the right tools)?
+- :mod:`evals.repeats` — :func:`summarize_repeats`: stable pass / flaky /
+  stable fail per case across repeated runs, and :func:`model_warnings` for
+  runs that hide or mix their model.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, Final
-
-# The assertion vocabulary a tool_output case may use. Kept here (not in
-# run_evals) so the validator and the evaluator can never disagree about which
-# checks exist -- a case using an unknown check is a dataset bug, and both the
-# structural validation pass and the grading pass read this same set.
-KNOWN_CHECKS: Final[frozenset[str]] = frozenset({"non_empty", "gte", "lte", "eq", "in_range"})
-
-# Sentinel used in a tool_selection case's ``expected_tool`` to mean "the model
-# should call NO tool at all" (a negative case). Encoded as JSON ``null`` in the
-# dataset; a purely positive dataset scores a fire-on-everything tool as perfect,
-# so negative cases are what stop that from passing unnoticed.
-NO_TOOL: Final[None] = None
-
-
-class PathNotFound(LookupError):
-    """Raised when a dotted assertion path does not resolve in a response.
-
-    Distinct from a failed assertion: a missing path means the *case* refers to
-    a field the response does not have (a dataset bug, or a renamed response
-    field), not that the value was wrong. Callers surface it as a failure with a
-    different message so the two are never confused.
-    """
-
-
-@dataclass(frozen=True)
-class AssertionResult:
-    """Outcome of evaluating one assertion against one response.
-
-    Attributes:
-        path: The dotted path this assertion addressed (e.g. ``freshness.staleness_ms``).
-        check: The check name, one of :data:`KNOWN_CHECKS`.
-        passed: Whether the assertion held.
-        detail: Human-readable explanation, always populated (on success too, so
-            a passing report can show what was actually compared).
-    """
-
-    path: str
-    check: str
-    passed: bool
-    detail: str
-
-
-@dataclass(frozen=True)
-class OutputCaseResult:
-    """Aggregate outcome for one ``tool_output`` case.
-
-    Attributes:
-        case_id: The case's ``id``.
-        tool: The tool the case exercised.
-        passed: True only if every assertion passed.
-        assertions: Per-assertion results, in dataset order.
-        error: Populated when the tool call itself raised, in which case
-            ``assertions`` is empty and ``passed`` is False. A tool that blew up
-            is a distinct failure from a tool that returned bad values.
-    """
-
-    case_id: str
-    tool: str
-    passed: bool
-    assertions: tuple[AssertionResult, ...] = ()
-    error: str | None = None
-
-
-@dataclass(frozen=True)
-class Observation:
-    """What a model actually did when shown one tool_selection prompt.
-
-    Deliberately decoupled from how it was collected. Hand-typed from a Claude
-    Desktop session and generated by an API runner produce the same shape, so
-    :func:`grade_selection_case` never needs to know which it is.
-
-    A turn can involve MORE THAN ONE tool call, so this records a list rather
-    than a single name -- a real finding on the first manual pass, where one
-    prompt drew two tools at once (hedging across a near-miss pair) and another
-    drew two in sequence (discovery, then the real query). Collapsing those to
-    one name would have scored both as clean passes and hidden the behaviour the
-    cases exist to detect.
-
-    Attributes:
-        case_id: The ``id`` of the case this observation answers.
-        observed_tools: Tool names the model called, **in call order**. Empty
-            when it called nothing (the correct answer for a negative case).
-        observed_args: Arguments per call, positionally parallel to
-            ``observed_tools``. Shorter lists are tolerated (a missing entry is
-            read as ``{}``) so a partially-recorded observation still grades.
-        model: Which model produced this -- including effort where it matters
-            (e.g. ``"claude-sonnet-5/medium"``), since effort changes
-            tool-calling behaviour. Recorded so results from different models
-            are never silently pooled into one score.
-        notes: Free-text, e.g. "answered from memory instead of calling".
-    """
-
-    case_id: str
-    observed_tools: list[str] = field(default_factory=list)
-    observed_args: list[Mapping[str, Any]] = field(default_factory=list)
-    model: str = "unknown"
-    notes: str = ""
-
-    @classmethod
-    def from_row(cls, row: Mapping[str, Any]) -> Observation:
-        """Build an observation from one results-file row.
-
-        Mechanism: takes a parsed JSONL row, accepts either the single-tool
-        shape (``observed_tool`` / ``observed_args`` as an object) or the
-        multi-tool shape (``observed_tools`` / ``observed_args`` as a list),
-        returns a normalized :class:`Observation`.
-
-        Both shapes are accepted so an existing results file does not have to be
-        rewritten when a later run happens to record two calls: only the rows
-        that need a list have to use one.
-
-        Args:
-            row: One parsed line of a results file.
-
-        Returns:
-            The normalized observation.
-
-        Raises:
-            ValueError: If ``id`` is missing or not a non-empty string.
-        """
-        case_id = row.get("id")
-        if not isinstance(case_id, str) or not case_id:
-            raise ValueError(f"row missing a non-empty string 'id': {row!r}")
-
-        if "observed_tools" in row:
-            raw_tools = row["observed_tools"] or []
-            tools = [str(t) for t in raw_tools] if isinstance(raw_tools, list) else []
-        else:
-            single = row.get("observed_tool")
-            tools = [] if single is None else [str(single)]
-
-        raw_args = row.get("observed_args")
-        if isinstance(raw_args, Mapping):
-            # Single-tool shape: one object. Meaningless without a call to own it.
-            args: list[Mapping[str, Any]] = [dict(raw_args)] if tools else []
-        elif isinstance(raw_args, list):
-            args = [dict(a) if isinstance(a, Mapping) else {} for a in raw_args]
-        else:
-            args = []
-
-        return cls(
-            case_id=case_id,
-            observed_tools=tools,
-            observed_args=args,
-            model=str(row.get("model", "unknown")),
-            notes=str(row.get("notes", "")),
-        )
-
-    def args_for(self, tool: str) -> Mapping[str, Any]:
-        """Return the arguments of the first call to ``tool``.
-
-        Mechanism: takes a tool name, finds its position in ``observed_tools``,
-        returns the arguments recorded at the same position (``{}`` if the tool
-        was not called or its arguments were not recorded).
-
-        Args:
-            tool: The tool name to look up.
-
-        Returns:
-            That call's arguments, or an empty mapping.
-        """
-        if tool not in self.observed_tools:
-            return {}
-        index = self.observed_tools.index(tool)
-        return self.observed_args[index] if index < len(self.observed_args) else {}
-
-
-@dataclass(frozen=True)
-class SelectionCaseResult:
-    """Aggregate outcome for one ``tool_selection`` case.
-
-    ``tool_ok`` and ``args_ok`` are reported separately and deliberately: per
-    ``evals/README.md`` the expected args are a *soft* expectation, so calling
-    the right tool with imperfect args is a materially different (and much less
-    serious) result than calling the wrong tool. Folding them into one boolean
-    would hide that.
-
-    ``observed_tools`` is kept in full rather than reduced to a single name, but
-    calling several tools is deliberately NOT scored. Extra calls may be
-    necessary sequencing (discover dex names, then query them) or unnecessary
-    hedging, and nothing here can distinguish the two -- so the list is reported
-    as a fact and the judgment stays with the human reading the case notes.
-
-    Attributes:
-        case_id: The case's ``id``.
-        expected_tool: Tool the case expects, or ``None`` for a negative case.
-        observed_tools: Tools the model actually called, in call order.
-        tool_ok: Whether the expected tool was called at all (for a negative
-            case, whether nothing was called). The headline metric.
-        args_ok: Whether every expected arg matched, or ``None`` when the case
-            declares no ``expected_args`` (nothing to check).
-        detail: Human-readable notes, including per-argument mismatches.
-    """
-
-    case_id: str
-    expected_tool: str | None
-    observed_tools: list[str]
-    tool_ok: bool
-    args_ok: bool | None
-    detail: tuple[str, ...] = ()
-
-
-def resolve_path(data: Mapping[str, Any], path: str) -> Any:
-    """Resolve a dotted ``path`` against a nested mapping.
-
-    Mechanism: takes a response mapping and a dotted path, walks the segments
-    left to right, returns the value at the end.
-
-    Args:
-        data: The response as plain data (typically ``response.model_dump()``).
-        path: Dotted path, e.g. ``"freshness.staleness_ms"``. A single segment
-            with no dots addresses a top-level field.
-
-    Returns:
-        The value at ``path``.
-
-    Raises:
-        PathNotFound: If any segment is missing, or if a non-final segment
-            resolves to something that is not a mapping (so the path cannot be
-            walked further).
-    """
-    current: Any = data
-    walked: list[str] = []
-    for segment in path.split("."):
-        if not isinstance(current, Mapping):
-            raise PathNotFound(
-                f"{'.'.join(walked) or '<root>'} is {type(current).__name__}, not a mapping; "
-                f"cannot resolve {segment!r} in path {path!r}"
-            )
-        if segment not in current:
-            available = ", ".join(sorted(current)[:8]) or "<empty>"
-            raise PathNotFound(
-                f"{path!r}: no key {segment!r} at "
-                f"{'.'.join(walked) or '<root>'} (available: {available})"
-            )
-        walked.append(segment)
-        current = current[segment]
-    return current
-
-
-def _as_number(value: Any) -> float:
-    """Coerce a JSON value to a float for ordered comparison.
-
-    Mechanism: takes a value, rejects anything not a real number, returns it as
-    a float.
-
-    ``bool`` is excluded even though it subclasses ``int`` -- ``True >= 0.5``
-    is legal Python but always a dataset bug, and silently comparing it would
-    turn a malformed case into a passing one.
-
-    Args:
-        value: The value to coerce.
-
-    Returns:
-        The value as a ``float``.
-
-    Raises:
-        TypeError: If ``value`` is not an ``int`` or ``float`` (or is a ``bool``).
-    """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise TypeError(f"expected a number, got {type(value).__name__}: {value!r}")
-    return float(value)
-
-
-def evaluate_assertion(data: Mapping[str, Any], assertion: Mapping[str, Any]) -> AssertionResult:
-    """Evaluate one assertion against a response.
-
-    Mechanism: takes a response mapping and one assertion, resolves the
-    assertion's dotted path, applies its check, returns pass/fail with a
-    human-readable explanation.
-
-    Every failure mode is returned as a failing :class:`AssertionResult` rather
-    than raised, so one malformed assertion never aborts a whole eval run --
-    the report shows what went wrong for that assertion and the rest still run.
-
-    Args:
-        data: The response as plain data.
-        assertion: A mapping with ``path`` (str), ``check`` (one of
-            :data:`KNOWN_CHECKS`), and — for the comparison checks — ``value``.
-            ``in_range`` expects ``value`` to be a two-element ``[lo, hi]``.
-
-    Returns:
-        An :class:`AssertionResult`. Never raises.
-    """
-    path = str(assertion.get("path", "<missing>"))
-    check = str(assertion.get("check", "<missing>"))
-
-    if check not in KNOWN_CHECKS:
-        return AssertionResult(path, check, False, f"unknown check {check!r}")
-
-    try:
-        actual = resolve_path(data, path)
-    except PathNotFound as exc:
-        return AssertionResult(path, check, False, str(exc))
-
-    if check == "non_empty":
-        # Sized values must actually contain something; unsized values only have
-        # to exist. `0` and `False` are legitimately non-empty scalars, so a
-        # plain truthiness test would wrongly fail them.
-        if isinstance(actual, (str, bytes, Sequence, Mapping)):
-            ok = len(actual) > 0
-            return AssertionResult(
-                path, check, ok, f"len={len(actual)}" + ("" if ok else " (empty)")
-            )
-        ok = actual is not None
-        return AssertionResult(path, check, ok, f"value={actual!r}")
-
-    if "value" not in assertion:
-        return AssertionResult(path, check, False, f"check {check!r} requires a 'value'")
-    expected = assertion["value"]
-
-    if check == "eq":
-        ok = bool(actual == expected)
-        return AssertionResult(path, check, ok, f"{actual!r} == {expected!r}")
-
-    if check == "in_range":
-        if not isinstance(expected, Sequence) or isinstance(expected, (str, bytes)):
-            return AssertionResult(path, check, False, f"in_range needs [lo, hi], got {expected!r}")
-        bounds = list(expected)
-        if len(bounds) != 2:
-            return AssertionResult(
-                path, check, False, f"in_range needs exactly 2 bounds, got {len(bounds)}"
-            )
-        try:
-            value, low, high = _as_number(actual), _as_number(bounds[0]), _as_number(bounds[1])
-        except TypeError as exc:
-            return AssertionResult(path, check, False, str(exc))
-        ok = low <= value <= high
-        return AssertionResult(path, check, ok, f"{value} in [{low}, {high}]")
-
-    # gte / lte
-    try:
-        value, limit = _as_number(actual), _as_number(expected)
-    except TypeError as exc:
-        return AssertionResult(path, check, False, str(exc))
-    ok = value >= limit if check == "gte" else value <= limit
-    symbol = ">=" if check == "gte" else "<="
-    return AssertionResult(path, check, ok, f"{value} {symbol} {limit}")
-
-
-def grade_output_case(
-    case: Mapping[str, Any],
-    response: Mapping[str, Any] | None,
-    error: str | None = None,
-) -> OutputCaseResult:
-    """Grade one ``tool_output`` case against the response its tool produced.
-
-    Mechanism: takes a case and either the tool's response or the error it
-    raised, evaluates every assertion, returns the aggregate outcome.
-
-    Args:
-        case: The dataset case (``id``, ``tool``, ``args``, ``assertions``).
-        response: The tool's response as plain data, or ``None`` if it failed.
-        error: The error text if the tool call raised; when set, no assertions
-            are evaluated and the case fails.
-
-    Returns:
-        An :class:`OutputCaseResult`. A case with zero assertions fails — an
-        empty assertion list would otherwise vacuously pass and silently
-        measure nothing.
-    """
-    case_id = str(case.get("id", "<no id>"))
-    tool = str(case.get("tool", "<no tool>"))
-
-    if error is not None:
-        return OutputCaseResult(case_id, tool, passed=False, error=error)
-    if response is None:
-        return OutputCaseResult(case_id, tool, passed=False, error="no response and no error")
-
-    raw = case.get("assertions")
-    assertions = [a for a in raw if isinstance(a, Mapping)] if isinstance(raw, list) else []
-    if not assertions:
-        return OutputCaseResult(case_id, tool, passed=False, error="case has no assertions")
-
-    results = tuple(evaluate_assertion(response, a) for a in assertions)
-    return OutputCaseResult(case_id, tool, all(r.passed for r in results), results)
-
-
-def grade_selection_case(case: Mapping[str, Any], observation: Observation) -> SelectionCaseResult:
-    """Grade one ``tool_selection`` case against what the model actually did.
-
-    Mechanism: takes a case and an observation, checks whether the expected tool
-    was among those called (and whether it was the only one, and whether its args
-    match), returns the three verdicts separately.
-
-    A turn may call several tools, so ``tool_ok`` asks only whether the expected
-    one was reached, not whether it was the only one called. The extra calls are
-    recorded in ``observed_tools`` and described in ``detail``, but not scored --
-    see :class:`SelectionCaseResult` for why.
-
-    Argument comparison is a **subset** check against the expected tool's own
-    call: every key in ``expected_args`` must be present and equal, but extra
-    args the model supplied are not penalised. Defaults and reasonable extras
-    (e.g. an explicit ``include_hip3: false``) are not routing errors, and
-    failing them would make the metric measure prompt-phrasing luck instead of
-    tool choice.
-
-    Args:
-        case: The dataset case (``id``, ``prompt``, ``expected_tool``, optional
-            ``expected_args``). ``expected_tool`` of ``None`` marks a negative
-            case: the correct behaviour is to call no tool at all.
-        observation: What the model did.
-
-    Returns:
-        A :class:`SelectionCaseResult`.
-    """
-    case_id = str(case.get("id", "<no id>"))
-    expected_tool_raw = case.get("expected_tool", NO_TOOL)
-    expected_tool = None if expected_tool_raw is None else str(expected_tool_raw)
-    observed = observation.observed_tools
-
-    detail: list[str] = []
-
-    if expected_tool is None:
-        # Negative case: the correct behaviour is to call nothing at all.
-        tool_ok = not observed
-        detail.append(
-            "called no tool (correct)"
-            if tool_ok
-            else f"expected NO tool, but called {', '.join(observed)}"
-        )
-    else:
-        tool_ok = expected_tool in observed
-        if not tool_ok:
-            detail.append(
-                f"expected {expected_tool}, but no tool was called"
-                if not observed
-                else f"expected {expected_tool}, got {', '.join(observed)}"
-            )
-        elif observed == [expected_tool]:
-            detail.append(f"called {expected_tool}")
-        else:
-            # Stated, not judged -- see the class docstring.
-            others = [t for t in observed if t != expected_tool]
-            detail.append(
-                f"called {expected_tool} (correct); also called {', '.join(others)}"
-                f" — {len(observed)} calls"
-            )
-
-    expected_args = case.get("expected_args")
-    args_ok: bool | None = None
-    if isinstance(expected_args, Mapping) and expected_args:
-        # Only meaningful when the expected tool was actually reached -- comparing
-        # args against a different tool's signature would report noise as a
-        # second failure.
-        if not tool_ok or expected_tool is None:
-            detail.append("args not compared (wrong tool)")
-        else:
-            actual_args = observation.args_for(expected_tool)
-            mismatches: list[str] = []
-            for key, want in expected_args.items():
-                if key not in actual_args:
-                    mismatches.append(f"{key}: missing (expected {want!r})")
-                elif actual_args[key] != want:
-                    mismatches.append(f"{key}: got {actual_args[key]!r}, want {want!r}")
-            args_ok = not mismatches
-            detail.extend(mismatches or ["args match"])
-
-    return SelectionCaseResult(
-        case_id=case_id,
-        expected_tool=expected_tool,
-        observed_tools=list(observed),
-        tool_ok=tool_ok,
-        args_ok=args_ok,
-        detail=tuple(detail),
-    )
+from evals.observation import NO_TOOL, Observation
+from evals.output_checks import (
+    DEFAULT_NEG_OF_TOLERANCE,
+    KNOWN_CHECKS,
+    AssertionResult,
+    OutputCaseResult,
+    PathNotFound,
+    evaluate_assertion,
+    grade_output_case,
+    resolve_path,
+)
+from evals.repeats import RepeatSummary, Stability, model_warnings, summarize_repeats
+from evals.selection import SelectionCaseResult, expected_tools_of, grade_selection_case
+
+__all__ = [
+    "DEFAULT_NEG_OF_TOLERANCE",
+    "KNOWN_CHECKS",
+    "NO_TOOL",
+    "AssertionResult",
+    "Observation",
+    "OutputCaseResult",
+    "PathNotFound",
+    "RepeatSummary",
+    "SelectionCaseResult",
+    "Stability",
+    "evaluate_assertion",
+    "expected_tools_of",
+    "grade_output_case",
+    "grade_selection_case",
+    "model_warnings",
+    "resolve_path",
+    "summarize_repeats",
+]

@@ -1,8 +1,18 @@
 # evals/
 
-Evaluation harness for `hlmcp`. Grading logic lives in `grader.py` (pure
-functions, no I/O, unit-tested offline in `tests/unit/test_evals_grader.py`);
-`run_evals.py` owns all I/O — loading datasets, calling tools, printing reports.
+Evaluation harness for `hlmcp`. Grading logic is pure (no I/O, unit-tested
+offline in `tests/unit/test_evals_grader.py`) and imported through `grader.py`,
+which re-exports one module per concern:
+
+| Module | Concern |
+|---|---|
+| `observation.py` | `Observation` — what a model did on one prompt (the results-row contract) |
+| `output_checks.py` | `tool_output` grading: assertions, `KNOWN_CHECKS`, `expect_error` |
+| `selection.py` | `tool_selection` grading: single-tool, multi-tool, negative cases |
+| `repeats.py` | per-case stability across repeated runs; model-mixing warnings |
+
+`run_evals.py` owns all I/O — loading datasets, calling tools, printing reports
+(tested in `tests/unit/test_run_evals.py`).
 
 It lives outside `src/` deliberately: it is tooling *about* the package, not part
 of the shipped package.
@@ -35,13 +45,33 @@ of the shipped package.
 }
 ```
 
-- `id` (str, unique), `prompt` (str), `expected_tool` are **required**.
+- `id` (str, unique), `prompt` (str), and **exactly one** of `expected_tool` /
+  `expected_tools` are **required** (both, or neither, is a validation error).
 - **`expected_tool: null` marks a negative case** — the correct behaviour is to
   call *no* tool. Include some: a tool that fires on everything scores 100% on a
   purely positive dataset.
+- **`expected_tools: [..]`** (2+ distinct names) marks a question that needs
+  several tools: it passes only if **all** are called. Call order is not scored;
+  extra tools are reported ("also called …"), not failed.
 - `expected_args` (object) is **optional** — a soft expectation, scored
   separately from tool match, as a **subset** check (extra args the model
-  supplies are not penalised).
+  supplies are not penalised). For an `expected_tools` case it is keyed by tool
+  name, since tools rarely share a signature:
+
+  ```json
+  {"id": "sel-018", "prompt": "Is BTC funding positive right now, and is the order book bid-heavy?",
+   "expected_tools": ["funding_carry", "order_book_imbalance"],
+   "expected_args": {"funding_carry": {"coin": "BTC"}, "order_book_imbalance": {"coin": "BTC"}},
+   "gate": true, "notes": "..."}
+  ```
+- `gate` (bool) is **optional**. `true` puts the case in the gate set — about a
+  dozen cases (a canary per tool, every tool pair in at least one direction,
+  2–3 negatives) run by hand on every docstring change and scored with
+  `--gate-only`.
+- `notes` should say which **axis** (own vocabulary, synonym/slang, indirect,
+  argument-bearing, HIP-3) or **tool pair and direction** the case covers, and
+  why its expected answer is right. Debatable cases say **DEBATABLE** and why.
+- Never renumber or rewrite an existing `id`: results files join on it. Append.
 
 ### tool_output case
 
@@ -58,14 +88,31 @@ of the shipped package.
 }
 ```
 
-- `id` (str, unique), `tool` (str), `args` (object), `assertions` (non-empty list)
-  are **required**. A case with no assertions **fails** rather than vacuously
-  passing — `all([])` is `True`, and a case that checks nothing must never report
-  green.
+- `id` (str, unique), `tool` (str), `args` (object), and either `assertions`
+  (non-empty list) or `expect_error` are **required**. A case with no assertions
+  **fails** rather than vacuously passing — `all([])` is `True`, and a case that
+  checks nothing must never report green.
 - Each assertion has a dotted `path` into the response, a `check`
-  (`non_empty` | `gte` | `lte` | `eq` | `in_range`), and (for comparison checks) a
-  `value`. `KNOWN_CHECKS` in `grader.py` is the single source of truth for the
-  vocabulary.
+  (`non_empty` | `gte` | `lte` | `eq` | `in_range` | `neg_of`), and (for
+  comparison checks) a `value`. `KNOWN_CHECKS` in `output_checks.py` is the
+  single source of truth for the vocabulary.
+- **`neg_of`** is cross-field: `value` is a **second path**, and the check passes
+  when `|response[path] + response[value]| <= tolerance` (optional absolute
+  `tolerance`, default `1e-12`). Use it for sign invariants on live data, where
+  the values move but their relationship must not:
+
+  ```json
+  {"path": "carry_annualized_long", "check": "neg_of", "value": "carry_annualized_short"}
+  ```
+- **`expect_error: "<ExceptionClassName>"`** makes the case pass only if the call
+  raises that exact class (by name; a subclass does not match). Such a case has
+  no `assertions`. It pins error paths, e.g. an unknown coin raising
+  `ValueError` from validation rather than `HLAPIError` from a retried 500:
+
+  ```json
+  {"id": "out-011", "tool": "funding_carry", "args": {"coin": "NOTACOIN"}, "expect_error": "ValueError"}
+  ```
+- Assert **invariants only**, never live exact values.
 - Prefer a **band** over a one-sided bound for values that can legitimately sit
   either side of a boundary. `staleness_ms` is deliberately unclamped (see
   `schemas/responses.py`), so `gte 0` flips with clock drift; `in_range` still
@@ -78,7 +125,21 @@ uv run python evals/run_evals.py                       # validate every dataset 
 uv run python evals/run_evals.py --type tool_selection # validate one dataset
 uv run python evals/run_evals.py --run-output          # execute vs live HL and grade the assertions
 uv run python evals/run_evals.py --score RESULTS.jsonl # score a recorded tool_selection run
+uv run python evals/run_evals.py --score R1.jsonl R2.jsonl R3.jsonl  # score repeats
+uv run python evals/run_evals.py --score RESULTS.jsonl --gate-only   # gate set only
 ```
+
+**One results file** prints per-case PASS/FAIL and the routing total, as it
+always has. **Several files** are scored as repeats of the same dataset: each
+case is reported as **stable pass** (passed in every run that observed it),
+**flaky** (mixed) or **stable fail** (never passed), followed by the totals. The
+target is regression detection — a case moving from 3/3 to 0/3 is the signal —
+not accuracy estimation.
+
+Every results row should carry `model` (including effort, e.g.
+`claude-sonnet-5/medium`). `--score` warns on stderr about rows with no `model`
+and about files recorded on different models, since medium and high runs are
+not comparable as repeats.
 
 `--run-output` needs network but no API key: it calls the same `compute_*`
 functions `server.py` wraps, so it exercises the real orchestration.

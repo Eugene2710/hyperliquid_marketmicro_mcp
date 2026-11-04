@@ -12,14 +12,19 @@ from typing import Any
 import pytest
 
 from evals.grader import (
+    DEFAULT_NEG_OF_TOLERANCE,
     KNOWN_CHECKS,
     AssertionResult,
     Observation,
     PathNotFound,
+    SelectionCaseResult,
     evaluate_assertion,
+    expected_tools_of,
     grade_output_case,
     grade_selection_case,
+    model_warnings,
     resolve_path,
+    summarize_repeats,
 )
 
 # A stand-in for an OrderBookImbalanceResponse.model_dump(), shaped like the
@@ -92,7 +97,7 @@ def test_every_check_in_both_directions(assertion: dict[str, Any], expected: boo
 
 def test_all_known_checks_are_covered_by_this_module() -> None:
     """Guard: if a new check is added to KNOWN_CHECKS, this file must grow too."""
-    assert KNOWN_CHECKS == {"non_empty", "gte", "lte", "eq", "in_range"}
+    assert KNOWN_CHECKS == {"non_empty", "gte", "lte", "eq", "in_range", "neg_of"}
 
 
 def test_non_empty_accepts_falsy_scalars() -> None:
@@ -424,3 +429,260 @@ def test_from_row_rejects_a_row_with_no_id() -> None:
     """The id is the join key to the dataset; a row without one cannot be graded."""
     with pytest.raises(ValueError, match="id"):
         Observation.from_row({"observed_tool": "order_book_imbalance"})
+
+
+# --------------------------------------------------------------------------
+# neg_of — cross-field sign invariant
+# --------------------------------------------------------------------------
+
+# Shaped like a FundingCarryResponse.model_dump(): the carry pair is the case
+# neg_of was built for.
+CARRY: dict[str, Any] = {
+    "carry_annualized_long": -0.1095,
+    "carry_annualized_short": 0.1095,
+    "carry_off": 0.2,
+    "coin": "BTC",
+}
+
+
+def test_neg_of_passes_when_the_fields_are_negatives() -> None:
+    """long == -short is exactly what the carry invariant asserts."""
+    result = evaluate_assertion(
+        CARRY,
+        {"path": "carry_annualized_long", "check": "neg_of", "value": "carry_annualized_short"},
+    )
+    assert result.passed is True
+
+
+def test_neg_of_fails_when_the_fields_are_not_negatives() -> None:
+    """Equal signs (a flipped-sign bug on one side) fail."""
+    result = evaluate_assertion(
+        CARRY, {"path": "carry_annualized_short", "check": "neg_of", "value": "carry_off"}
+    )
+    assert result.passed is False
+    assert "|a+b|" in result.detail
+
+
+def test_neg_of_missing_second_path_fails_with_the_path_error() -> None:
+    """A bad second path surfaces resolve_path's PathNotFound message, not a crash."""
+    with pytest.raises(PathNotFound) as exc:
+        resolve_path(CARRY, "carry_annualized_shrt")
+    result = evaluate_assertion(
+        CARRY,
+        {"path": "carry_annualized_long", "check": "neg_of", "value": "carry_annualized_shrt"},
+    )
+    assert result.passed is False
+    assert result.detail == str(exc.value)
+
+
+def test_neg_of_value_must_be_a_path_string() -> None:
+    """A numeric `value` is a dataset bug (neg_of compares two fields), so it fails."""
+    result = evaluate_assertion(
+        CARRY, {"path": "carry_annualized_long", "check": "neg_of", "value": 0.1095}
+    )
+    assert result.passed is False
+
+
+def test_neg_of_rejects_non_numeric_fields() -> None:
+    """A string field cannot be negated; the assertion fails rather than raising."""
+    result = evaluate_assertion(
+        CARRY, {"path": "coin", "check": "neg_of", "value": "carry_annualized_short"}
+    )
+    assert result.passed is False
+
+
+@pytest.mark.parametrize(
+    ("gap", "tolerance", "expected"),
+    [
+        (0.5, 0.5, True),  # exactly at the tolerance: inclusive
+        (0.5, 0.25, False),  # beyond it
+        (0.0, 0.0, True),  # exact negatives with zero tolerance
+        (DEFAULT_NEG_OF_TOLERANCE * 10, None, False),  # default tolerance is tight
+    ],
+    ids=["at_edge", "beyond", "zero_exact", "default_tight"],
+)
+def test_neg_of_tolerance_edge(gap: float, tolerance: float | None, expected: bool) -> None:
+    """|a + b| <= tolerance, inclusive; omitted tolerance uses the tight default.
+
+    Values are binary-exact (0.25, 0.5, 1.0) so the edge case tests the
+    comparison, not float rounding.
+    """
+    data: dict[str, Any] = {"a": -1.0, "b": 1.0 + gap}
+    assertion: dict[str, Any] = {"path": "a", "check": "neg_of", "value": "b"}
+    if tolerance is not None:
+        assertion["tolerance"] = tolerance
+    assert evaluate_assertion(data, assertion).passed is expected
+
+
+# --------------------------------------------------------------------------
+# expect_error — output cases that must raise
+# --------------------------------------------------------------------------
+
+ERROR_CASE: dict[str, Any] = {
+    "id": "case-unknown-coin",
+    "tool": "funding_carry",
+    "args": {"coin": "NOTACOIN"},
+    "expect_error": "ValueError",
+}
+
+
+def test_expect_error_passes_on_the_expected_class() -> None:
+    """The call raised the named class: the case passes and records what was raised."""
+    result = grade_output_case(
+        ERROR_CASE, None, error="ValueError: 'NOTACOIN' is not listed", error_type="ValueError"
+    )
+    assert result.passed is True
+    assert result.error == "ValueError: 'NOTACOIN' is not listed"
+
+
+def test_expect_error_fails_when_the_call_succeeds() -> None:
+    """An error path that silently starts returning data is a regression."""
+    result = grade_output_case(ERROR_CASE, {"coin": "NOTACOIN"})
+    assert result.passed is False
+    assert "succeeded" in str(result.error)
+
+
+def test_expect_error_fails_on_a_different_class() -> None:
+    """E.g. an unvalidated coin reaching fundingHistory raises HLAPIError, not ValueError."""
+    result = grade_output_case(
+        ERROR_CASE, None, error="HLAPIError: HTTP 500", error_type="HLAPIError"
+    )
+    assert result.passed is False
+    assert "expected ValueError, got HLAPIError" in str(result.error)
+
+
+# --------------------------------------------------------------------------
+# expected_tools — multi-tool selection cases
+# --------------------------------------------------------------------------
+
+BOTH_TOOLS: dict[str, Any] = {
+    "id": "case-both",
+    "expected_tools": ["funding_carry", "order_book_imbalance"],
+    "expected_args": {"funding_carry": {"coin": "BTC"}, "order_book_imbalance": {"coin": "BTC"}},
+}
+
+
+def test_expected_tools_all_called_passes_in_any_order() -> None:
+    """Every expected tool reached; call order is not scored."""
+    obs = Observation(
+        "case-both", ["order_book_imbalance", "funding_carry"], [{"coin": "BTC"}, {"coin": "BTC"}]
+    )
+    result = grade_selection_case(BOTH_TOOLS, obs)
+    assert (result.tool_ok, result.args_ok) == (True, True)
+    assert result.expected_tool is None
+    assert result.expected_tools == ("funding_carry", "order_book_imbalance")
+
+
+def test_expected_tools_one_missing_fails_and_names_it() -> None:
+    """Answering half of a two-part question is a fail, and the detail says which half."""
+    result = grade_selection_case(BOTH_TOOLS, Observation("case-both", ["funding_carry"]))
+    assert result.tool_ok is False
+    assert "missing order_book_imbalance" in result.detail[0]
+    assert result.args_ok is None
+
+
+def test_expected_tools_extra_tool_passes_with_also_called() -> None:
+    """Extras are stated, not judged -- the same rule as single-tool cases."""
+    obs = Observation(
+        "case-both",
+        ["funding_carry", "order_book_imbalance", "whale_position_monitor"],
+        [{"coin": "BTC"}, {"coin": "BTC"}, {}],
+    )
+    result = grade_selection_case(BOTH_TOOLS, obs)
+    assert result.tool_ok is True
+    assert "also called whale_position_monitor" in result.detail[0]
+
+
+def test_expected_tools_args_are_compared_per_tool() -> None:
+    """Each tool's args are checked against its own call and named on mismatch."""
+    obs = Observation(
+        "case-both", ["funding_carry", "order_book_imbalance"], [{"coin": "BTC"}, {"coin": "ETH"}]
+    )
+    result = grade_selection_case(BOTH_TOOLS, obs)
+    assert (result.tool_ok, result.args_ok) == (True, False)
+    assert "order_book_imbalance.coin: got 'ETH', want 'BTC'" in result.detail
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        {"id": "x", "expected_tool": "funding_carry", "expected_tools": ["a", "b"]},  # both
+        {"id": "x"},  # neither
+        {"id": "x", "expected_tools": ["funding_carry"]},  # one tool belongs in expected_tool
+        {"id": "x", "expected_tools": ["funding_carry", "funding_carry"]},  # duplicate
+        {"id": "x", "expected_tools": []},  # none is expected_tool: null
+        {"id": "x", "expected_tool": 3},  # not a name
+    ],
+    ids=["both", "neither", "single_in_list", "duplicate", "empty", "non_string"],
+)
+def test_expected_tools_of_rejects_malformed_cases(case: dict[str, Any]) -> None:
+    """Validation (which calls this) rejects both, neither, and malformed lists."""
+    with pytest.raises(ValueError):
+        expected_tools_of(case)
+
+
+def test_expected_tools_of_reads_each_shape() -> None:
+    """Negative, single and multi cases normalize to a tuple."""
+    assert expected_tools_of({"expected_tool": None}) == ()
+    assert expected_tools_of({"expected_tool": "list_hip3_dexes"}) == ("list_hip3_dexes",)
+    assert expected_tools_of(BOTH_TOOLS) == ("funding_carry", "order_book_imbalance")
+
+
+def test_malformed_selection_case_grades_as_a_failure() -> None:
+    """Grading a malformed case fails visibly instead of raising mid-run."""
+    result = grade_selection_case({"id": "x"}, Observation("x", []))
+    assert result.tool_ok is False
+    assert result.detail[0].startswith("malformed case:")
+
+
+# --------------------------------------------------------------------------
+# Repeats — stability across runs, model warnings
+# --------------------------------------------------------------------------
+
+
+def _result(case_id: str, ok: bool) -> SelectionCaseResult:
+    """Build a minimal graded result for the repeat tests."""
+    return SelectionCaseResult(case_id, "funding_carry", [], ok, None, ("ok" if ok else "miss",))
+
+
+def test_summarize_repeats_classifies_each_case() -> None:
+    """All pass -> stable pass; mixed -> flaky; none -> stable fail; first-seen order."""
+    runs = [
+        [_result("a", True), _result("b", True), _result("c", False)],
+        [_result("a", True), _result("b", False), _result("c", False)],
+        [_result("a", True), _result("b", True), _result("c", False)],
+    ]
+    summaries = summarize_repeats(runs)
+    assert [(s.case_id, s.n_passed, s.n_runs, s.stability) for s in summaries] == [
+        ("a", 3, 3, "stable pass"),
+        ("b", 2, 3, "flaky"),
+        ("c", 0, 3, "stable fail"),
+    ]
+    assert summaries[2].failures == ("miss", "miss", "miss")
+
+
+def test_summarize_repeats_counts_only_runs_that_observed_the_case() -> None:
+    """A run that skipped a case is not a failure of that case."""
+    summaries = summarize_repeats([[_result("a", True)], []])
+    assert (summaries[0].n_runs, summaries[0].stability) == (1, "stable pass")
+
+
+def test_model_warnings_flags_mixed_models_and_missing_model() -> None:
+    """Medium vs high in one scoring set is visible; so is a row with no model."""
+    warnings = model_warnings(
+        {
+            "r1.jsonl": [Observation("a", model="claude-sonnet-5/medium"), Observation("b")],
+            "r2.jsonl": [Observation("a", model="claude-sonnet-5/high")],
+        }
+    )
+    assert any("r1.jsonl: no 'model' on row(s) b" in w for w in warnings)
+    assert any("mix models" in w for w in warnings)
+
+
+def test_model_warnings_silent_when_one_model() -> None:
+    """Consistent runs produce no noise."""
+    runs = {
+        "r1.jsonl": [Observation("a", model="claude-sonnet-5/medium")],
+        "r2.jsonl": [Observation("a", model="claude-sonnet-5/medium")],
+    }
+    assert model_warnings(runs) == []
