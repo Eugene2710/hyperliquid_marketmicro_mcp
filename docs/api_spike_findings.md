@@ -189,6 +189,20 @@ market); `@150` (spot index). Spot uses `PURR/USDC` for PURR and `@{index}`
 otherwise. Remapping gotcha: BTC/USDC in the HL app is UBTC/USDC on mainnet
 HyperCore — use the L1 name to detect remappings.
 
+**Unknown symbol → HTTP 500 with body `null`** on `l2Book` too (live 2026-11-03:
+`NOTACOIN`, ~2.0s through the retries, surfacing as `HLAPIError`), the same
+shape as `fundingHistory` below. `order_book_imbalance` therefore validates
+**perp** symbols (native and dex-prefixed HIP-3) against their dex's
+`metaAndAssetCtxs` universe before the first `l2Book` call; unknown or delisted
+→ `ValueError` in ~0.1–0.3s. **Spot symbols (`@{index}`, `BASE/QUOTE`) are not
+validated**: that universe lists perps only, so an unknown spot symbol still
+takes the retried-500 path. Cost: the market list (native ~72 KB, 120–260 ms)
+is saved per dex for `HL_UNIVERSE_CACHE_TTL_S` (default 300 s), so only the
+first call per dex pays it (live 2026-11-04: BTC 0.49 s first call, 0.18 s
+after). A symbol not found in the saved list is re-checked against a fresh
+download once before it is rejected, so a new listing is never turned away.
+Only the list is saved; the live funding/price data in the same response is not.
+
 ## Funding — metaAndAssetCtxs / fundingHistory / predictedFundings (live-probed 2026-10-05)
 
 Probed with read-only curl while planning the `funding_carry` tool; fixtures
@@ -219,7 +233,8 @@ recorded the same day (`tests/fixtures/meta_and_asset_ctxs*.json`,
 - HIP-3 coins work with the prefixed name (`xyz:XYZ100`).
 - **Unknown coin → HTTP 500 with body `null`.** 5xx is retryable in our tenacity
   policy, so a typo would burn 3 attempts. Validate the coin against the
-  `metaAndAssetCtxs` universe BEFORE calling (the `funding_carry` tool does).
+  `metaAndAssetCtxs` universe BEFORE calling (the `funding_carry` tool does;
+  so does `order_book_imbalance` for `l2Book`, see Q7).
 
 **`predictedFundings`** (`{"type": "predictedFundings"}`):
 - `[[coin, [[venue, {fundingRate, nextFundingTime, fundingIntervalHours} | null], ...]], ...]`,

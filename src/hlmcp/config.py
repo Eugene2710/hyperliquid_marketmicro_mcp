@@ -2,8 +2,8 @@
 
 A single immutable :class:`HLConfig` carries every operational knob the
 Hyperliquid REST adapter needs: the endpoint URL, the concurrency cap, the
-token-bucket rate-limit parameters, the per-request timeout, and the HIP-3
-``perpDexs`` cache TTL. :func:`load_config` builds one from environment
+token-bucket rate-limit parameters, the per-request timeout, and the cache
+TTLs (HIP-3 ``perpDexs`` and the per-dex perp universe). :func:`load_config` builds one from environment
 variables (with ``.env`` support via ``python-dotenv``), falling back to the
 spike-derived defaults below.
 
@@ -20,6 +20,11 @@ Provenance of the defaults (see ``docs/architecture.md`` "Operating envelope"):
   successful requests are not killed while dead ones still fail fast.
 - ``dex_cache_ttl_s = 300`` — the ``perpDexs`` list changes only when a new HIP-3
   deployer comes online (rare), so a 5-minute cache is safe (Q2c).
+- ``universe_cache_ttl_s = 300`` — **[judgment call]** the per-dex perp universe
+  (``metaAndAssetCtxs`` ``meta``) used to validate ``order_book_imbalance`` symbols
+  changes on listings/delistings. A stale NEGATIVE answer is self-correcting (the
+  tool refetches once before rejecting), so the TTL only bounds how long a fresh
+  delisting can still pass validation; 5 minutes keeps that short.
 
 This module is PURE configuration: no I/O beyond reading the environment in
 :func:`load_config`.
@@ -51,6 +56,9 @@ DEFAULT_REQUEST_TIMEOUT_S: float = 4.0
 
 DEFAULT_DEX_CACHE_TTL_S: float = 300.0
 """perpDexs (HIP-3 discovery) cache TTL, seconds. The list changes rarely (Q2c)."""
+
+DEFAULT_UNIVERSE_CACHE_TTL_S: float = 300.0
+"""Per-dex perp universe cache TTL, seconds. [judgment call] See module docstring."""
 
 
 def _parse_sample_wallets(raw: str | None) -> tuple[str, ...]:
@@ -93,6 +101,9 @@ class HLConfig:
         request_timeout_s: Per-request HTTP timeout in seconds.
         dex_cache_ttl_s: How long the ``perpDexs`` (HIP-3 discovery) result is
             cached before a refetch, in seconds.
+        universe_cache_ttl_s: How long each dex's perp universe (the ``meta``
+            half of ``metaAndAssetCtxs``, used for symbol validation) is cached
+            before a refetch, in seconds.
         sample_wallets: Sample wallet addresses from ``HL_SAMPLE_WALLETS``, used
             by integration tests and (later) as default tool inputs. NOT
             normalized — the venue normalizes before sending.
@@ -104,6 +115,7 @@ class HLConfig:
     burst_capacity: float = DEFAULT_BURST_CAPACITY
     request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
     dex_cache_ttl_s: float = DEFAULT_DEX_CACHE_TTL_S
+    universe_cache_ttl_s: float = DEFAULT_UNIVERSE_CACHE_TTL_S
     sample_wallets: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
@@ -126,6 +138,8 @@ class HLConfig:
             raise ValueError(f"request_timeout_s must be > 0, got {self.request_timeout_s}")
         if self.dex_cache_ttl_s < 0:
             raise ValueError(f"dex_cache_ttl_s must be >= 0, got {self.dex_cache_ttl_s}")
+        if self.universe_cache_ttl_s < 0:
+            raise ValueError(f"universe_cache_ttl_s must be >= 0, got {self.universe_cache_ttl_s}")
 
 
 def load_config() -> HLConfig:
@@ -145,6 +159,7 @@ def load_config() -> HLConfig:
     - ``HL_BURST_CAPACITY`` — float
     - ``HL_REQUEST_TIMEOUT_S`` — float
     - ``HL_DEX_CACHE_TTL_S`` — float
+    - ``HL_UNIVERSE_CACHE_TTL_S`` — float
     - ``HL_SAMPLE_WALLETS`` — comma-separated addresses
 
     Returns:
@@ -181,6 +196,7 @@ def load_config() -> HLConfig:
         burst_capacity=_float("HL_BURST_CAPACITY", DEFAULT_BURST_CAPACITY),
         request_timeout_s=_float("HL_REQUEST_TIMEOUT_S", DEFAULT_REQUEST_TIMEOUT_S),
         dex_cache_ttl_s=_float("HL_DEX_CACHE_TTL_S", DEFAULT_DEX_CACHE_TTL_S),
+        universe_cache_ttl_s=_float("HL_UNIVERSE_CACHE_TTL_S", DEFAULT_UNIVERSE_CACHE_TTL_S),
         sample_wallets=_parse_sample_wallets(os.environ.get("HL_SAMPLE_WALLETS")),
     )
 

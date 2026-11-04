@@ -317,6 +317,7 @@ see `.env.example`), falling back to spike-derived defaults:
 | `HL_BURST_CAPACITY` | `15.0` | token-bucket burst size |
 | `HL_REQUEST_TIMEOUT_S` | `4.0` | per-request timeout (s) |
 | `HL_DEX_CACHE_TTL_S` | `300.0` | HIP-3 discovery cache TTL (s) |
+| `HL_UNIVERSE_CACHE_TTL_S` | `300.0` | per-dex perp universe cache TTL (s), for symbol validation |
 | `HL_SAMPLE_WALLETS` | *(unset)* | comma-separated addresses for integration tests |
 
 ## What this *isn't*

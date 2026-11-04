@@ -13,28 +13,62 @@ from typing import Any
 import pytest
 
 from hlmcp.analytics.aggregation import L2BookParams
-from hlmcp.schemas.hl_api import HLL2Book, HLL2Level
+from hlmcp.schemas.hl_api import HLL2Book, HLL2Level, HLMeta, HLMetaAndAssetCtxs
 from hlmcp.schemas.responses import OrderBookImbalanceResponse
-from hlmcp.tools.order_book_imbalance import compute_order_book_imbalance
+from hlmcp.tools.order_book_imbalance import compute_order_book_imbalance, is_spot_symbol
+from tests.conftest import load_fixture
 
 
 class _FakeVenue:
     """A stand-in for HyperliquidPublic that returns a fixed book and records calls.
 
+    Market lists come from the recorded ``metaAndAssetCtxs`` fixtures (native:
+    BTC, ETH, XRP trading, MATIC delisted; ``xyz``), so symbol checks run against
+    real data.
+
     Attributes:
         calls: The ``params`` argument of every ``fetch_l2_book`` call, in order
             (``None`` for the full-precision probe).
+        universe_calls: ``(dex, refresh)`` for every ``fetch_perp_universe`` call.
     """
 
-    def __init__(self, book: HLL2Book) -> None:
-        """Store the book to return from every fetch and init the call log."""
+    def __init__(self, book: HLL2Book, *, stale: dict[str, HLMeta] | None = None) -> None:
+        """Store the book and market lists, and init the call logs.
+
+        Args:
+            book: The book every ``fetch_l2_book`` returns.
+            stale: Optional per-dex list returned when ``refresh`` is False, to
+                simulate a saved copy that predates a listing change. A
+                ``refresh=True`` call always gets the fixture (the "fresh" list).
+        """
         self._book: HLL2Book = book
+        self._fresh: dict[str, HLMeta] = {
+            "": HLMetaAndAssetCtxs.model_validate(load_fixture("meta_and_asset_ctxs.json")).meta,
+            "xyz": HLMetaAndAssetCtxs.model_validate(
+                load_fixture("meta_and_asset_ctxs_xyz.json")
+            ).meta,
+        }
+        self._stale: dict[str, HLMeta] = stale or {}
         self.calls: list[L2BookParams | None] = []
+        self.universe_calls: list[tuple[str, bool]] = []
 
     async def fetch_l2_book(self, coin: str, params: L2BookParams | None = None) -> HLL2Book:
         """Record the requested params and return the configured book."""
         self.calls.append(params)
         return self._book
+
+    async def fetch_perp_universe(self, dex: str = "", *, refresh: bool = False) -> HLMeta:
+        """Record the call; return the stale list if set and not refreshing, else the fixture.
+
+        Raises:
+            ValueError: For a dex with no fixture, as the real venue does.
+        """
+        self.universe_calls.append((dex, refresh))
+        if dex not in self._fresh:
+            raise ValueError(f"Unknown dex {dex!r}")
+        if not refresh and dex in self._stale:
+            return self._stale[dex]
+        return self._fresh[dex]
 
 
 def _make_book(
@@ -140,3 +174,118 @@ async def test_empty_bands_raises_before_any_fetch() -> None:
     with pytest.raises(ValueError, match="at least one band"):
         await compute_order_book_imbalance(venue, "XRP", [])  # type: ignore[arg-type]
     assert venue.calls == []
+    assert venue.universe_calls == []
+
+
+# --------------------------------------------------------------------------
+# Symbol validation (before any l2Book call)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("coin", ["btc", "NOT_A_COIN", "xyz:NOPE"])
+async def test_unknown_perp_raises_before_any_book_fetch(coin: str) -> None:
+    """Unknown symbols (incl. wrong case) raise ValueError; l2Book is never called.
+
+    Live, an unknown symbol on l2Book is an HTTP 500 that the retry policy
+    treats as transient, so it would cost three attempts and an opaque
+    HLAPIError instead of a message naming the problem.
+    """
+    venue = _FakeVenue(_make_book(["1.0"], ["1.1"]))
+    with pytest.raises(ValueError, match="not a listed perp"):
+        await compute_order_book_imbalance(venue, coin)  # type: ignore[arg-type]
+    assert venue.calls == []
+
+
+async def test_delisted_perp_raises_before_any_book_fetch() -> None:
+    """A delisted market (MATIC in the fixture) has no live book."""
+    venue = _FakeVenue(_make_book(["1.0"], ["1.1"]))
+    with pytest.raises(ValueError, match="delisted"):
+        await compute_order_book_imbalance(venue, "MATIC")  # type: ignore[arg-type]
+    assert venue.calls == []
+
+
+async def test_unknown_dex_propagates_before_any_book_fetch() -> None:
+    """An unknown dex prefix surfaces the venue's ValueError."""
+    venue = _FakeVenue(_make_book(["1.0"], ["1.1"]))
+    with pytest.raises(ValueError, match="dex"):
+        await compute_order_book_imbalance(venue, "nodex:BTC")  # type: ignore[arg-type]
+    assert venue.calls == []
+
+
+async def test_hip3_symbol_is_validated_on_its_own_dex() -> None:
+    """A dex-prefixed symbol is looked up in that dex's list (saved copy, no refresh)."""
+    venue = _FakeVenue(_make_book(["27950"], ["27951"], coin="xyz:XYZ100"))
+    resp = await compute_order_book_imbalance(venue, "xyz:XYZ100", [3.0])  # type: ignore[arg-type]
+    assert venue.universe_calls == [("xyz", False)]
+    assert resp.coin == "xyz:XYZ100"
+
+
+@pytest.mark.parametrize("coin", ["@150", "PURR/USDC"])
+async def test_spot_symbols_skip_perp_validation(coin: str) -> None:
+    """Spot books are not in the perp universe, so they go straight to l2Book."""
+    venue = _FakeVenue(_make_book(["1.1250"], ["1.1251"], coin=coin))
+    await compute_order_book_imbalance(venue, coin, [3.0])  # type: ignore[arg-type]
+    assert venue.universe_calls == []
+    assert venue.calls == [None]
+
+
+@pytest.mark.parametrize(
+    ("coin", "spot"),
+    [("@150", True), ("PURR/USDC", True), ("BTC", False), ("xyz:XYZ100", False), ("kPEPE", False)],
+)
+def test_is_spot_symbol(coin: str, spot: bool) -> None:
+    """Spot = '@<index>' or 'BASE/QUOTE'; native and HIP-3 perps are not spot."""
+    assert is_spot_symbol(coin) is spot
+
+
+# --------------------------------------------------------------------------
+# Saved market list: refresh once before rejecting
+# --------------------------------------------------------------------------
+
+
+def _native_meta() -> HLMeta:
+    """Return the recorded native market list."""
+    return HLMetaAndAssetCtxs.model_validate(load_fixture("meta_and_asset_ctxs.json")).meta
+
+
+async def test_listed_coin_uses_saved_list_without_refresh() -> None:
+    """A coin found in the saved list costs one lookup and no fresh download."""
+    venue = _FakeVenue(_make_book(["1.1250"], ["1.1251"], coin="XRP"))
+    await compute_order_book_imbalance(venue, "XRP", [3.0])  # type: ignore[arg-type]
+    assert venue.universe_calls == [("", False)]
+
+
+async def test_unknown_coin_refreshes_once_then_raises() -> None:
+    """A miss is re-checked against a fresh list exactly once before rejecting."""
+    venue = _FakeVenue(_make_book(["1.0"], ["1.1"]))
+    with pytest.raises(ValueError, match="not a listed perp"):
+        await compute_order_book_imbalance(venue, "NOT_A_COIN")  # type: ignore[arg-type]
+    assert venue.universe_calls == [("", False), ("", True)]
+
+
+async def test_new_listing_missing_from_saved_list_is_accepted() -> None:
+    """A market listed after the saved copy was taken is found on refresh, not rejected."""
+    fresh = _native_meta()
+    stale = HLMeta(universe=[a for a in fresh.universe if a.name != "XRP"])
+    venue = _FakeVenue(_make_book(["1.1250"], ["1.1251"], coin="XRP"), stale={"": stale})
+
+    resp = await compute_order_book_imbalance(venue, "XRP", [3.0])  # type: ignore[arg-type]
+
+    assert venue.universe_calls == [("", False), ("", True)]
+    assert resp.coin == "XRP"
+
+
+async def test_relisting_marked_delisted_in_saved_list_is_accepted() -> None:
+    """A saved copy saying 'delisted' is re-checked; the fresh list wins."""
+    fresh = _native_meta()
+    stale = HLMeta(
+        universe=[
+            a.model_copy(update={"isDelisted": True}) if a.name == "XRP" else a
+            for a in fresh.universe
+        ]
+    )
+    venue = _FakeVenue(_make_book(["1.1250"], ["1.1251"], coin="XRP"), stale={"": stale})
+
+    await compute_order_book_imbalance(venue, "XRP", [3.0])  # type: ignore[arg-type]
+
+    assert venue.universe_calls == [("", False), ("", True)]

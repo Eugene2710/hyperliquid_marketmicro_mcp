@@ -24,6 +24,8 @@ What this adapter owns:
   ``dex`` is validated against the live ``perpDexs`` list client-side before any
   ``clearinghouseState`` call.
 - HIP-3 discovery + caching: ``perpDexs`` cached ~5 min.
+- Per-dex market list (for symbol checks) cached ~5 min; the live market data
+  that arrives with it is never cached.
 
 All knobs come from an injected :class:`~hlmcp.config.HLConfig`.
 """
@@ -48,6 +50,7 @@ from hlmcp.schemas.hl_api import (
     HLClearinghouseState,
     HLFundingHistoryEntry,
     HLL2Book,
+    HLMeta,
     HLMetaAndAssetCtxs,
     HLPerpDexs,
     HLPredictedFundings,
@@ -224,6 +227,11 @@ class HyperliquidPublic:
         # exactly one coroutine do the cold fetch; the rest await it and then read
         # the now-warm cache. Only contended during the cold window.
         self._dex_cache_lock: asyncio.Lock = asyncio.Lock()
+        # Per-dex perp universe cache (the ``meta`` half of metaAndAssetCtxs only;
+        # the ctxs are live market data and are never cached): dex -> (meta,
+        # monotonic fetch time). Single-flighted like the perpDexs cache.
+        self._universe_cache: dict[str, tuple[HLMeta, float]] = {}
+        self._universe_cache_lock: asyncio.Lock = asyncio.Lock()
 
     async def __aenter__(self) -> "HyperliquidPublic":
         """
@@ -392,7 +400,7 @@ class HyperliquidPublic:
         if dex not in known:
             # use !r to force repr() string representation for full string
             raise ValueError(
-                f"Unkown dex {dex!r}; known {sorted(known)}."
+                f"Unknown dex {dex!r}; known {sorted(known)}. "
                 f"Use the empty string {NATIVE_HL_DEX!r} for native HL perps."
             )
 
@@ -583,6 +591,60 @@ class HyperliquidPublic:
         await self._validate_dex(dex)
         raw: Any = await self._post({"type": "metaAndAssetCtxs", "dex": dex})
         return HLMetaAndAssetCtxs.model_validate(raw)
+
+    async def fetch_perp_universe(
+        self, dex: str = NATIVE_HL_DEX, *, refresh: bool = False
+    ) -> HLMeta:
+        """
+        Return the list of perp markets on one dex, reusing a saved copy for a while.
+
+        Used to check a symbol exists before asking for its order book.
+
+        Mechanism:
+            1. If this dex's list was downloaded less than
+               ``config.universe_cache_ttl_s`` seconds ago (default 5 minutes),
+               return that saved copy. No network call.
+            2. Otherwise download ``metaAndAssetCtxs`` for the dex, save the
+               market list with the time it was fetched, and return it.
+            3. If several calls arrive together while the copy is missing or
+               old, only one downloads; the others wait and reuse its result.
+            4. ``refresh=True`` skips step 1 and always downloads.
+
+        Only the market list is saved. The live numbers in the same download
+        (funding, prices, open interest) go stale in seconds, so they are
+        dropped; use :meth:`fetch_meta_and_asset_ctxs` for those.
+
+        A saved list can miss a market listed in the last few minutes, so a
+        caller that does not find a symbol should ask again with
+        ``refresh=True`` before rejecting it.
+
+        Args:
+            dex: Dex name; "" (default) for native HL, else a HIP-3 name.
+            refresh: Keyword-only. ``True`` ignores the saved copy and downloads
+                a fresh one (which is then saved).
+
+        Returns:
+            Parsed class ``HLMeta`` (the dex's market list).
+
+        Raises:
+            ValueError: If ``dex`` is unknown (raised before any network call).
+            HLAPIError: On an API-level error.
+        """
+        ttl_s: float = self._config.universe_cache_ttl_s
+        saved: tuple[HLMeta, float] | None = self._universe_cache.get(dex)
+        if not refresh and saved is not None and (time.monotonic() - saved[1]) < ttl_s:
+            return saved[0]
+
+        async with self._universe_cache_lock:
+            # Check again now that we hold the lock: another call may have
+            # downloaded the list while this one waited (step 3).
+            saved = self._universe_cache.get(dex)
+            now: float = time.monotonic()
+            if not refresh and saved is not None and (now - saved[1]) < ttl_s:
+                return saved[0]
+            meta: HLMeta = (await self.fetch_meta_and_asset_ctxs(dex)).meta
+            self._universe_cache[dex] = (meta, now)
+            return meta
 
     async def fetch_funding_history(
         self, coin: str, start_ms: int, end_ms: int

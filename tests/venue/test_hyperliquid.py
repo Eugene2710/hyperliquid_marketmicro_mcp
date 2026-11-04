@@ -26,6 +26,7 @@ from hlmcp.config import HLConfig
 from hlmcp.schemas.hl_api import (
     HLClearinghouseState,
     HLL2Book,
+    HLMeta,
     HLMetaAndAssetCtxs,
     HLPerpDexs,
     HLPredictedFundings,
@@ -528,6 +529,126 @@ async def test_meta_and_asset_ctxs_unknown_dex_raises_before_network(
         with pytest.raises(ValueError, match="dex"):
             await venue.fetch_meta_and_asset_ctxs("does-not-exist")
     assert all(p["type"] != "metaAndAssetCtxs" for p in seen)
+
+
+# --------------------------------------------------------------------------- #
+# fetch_perp_universe: the saved per-dex market list                          #
+# --------------------------------------------------------------------------- #
+
+
+def _universe_downloads(seen: list[dict[str, Any]]) -> list[str]:
+    """Return the dex of every metaAndAssetCtxs request, in order."""
+    return [p["dex"] for p in seen if p["type"] == "metaAndAssetCtxs"]
+
+
+async def test_perp_universe_reuses_saved_copy_within_ttl(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """A second call within the TTL is served from the saved copy: one download."""
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(
+            perpdexs=load_json("perpdexs.json"),
+            meta_ctxs=load_json("meta_and_asset_ctxs_xyz.json"),
+            seen=seen,
+        )
+    )
+    async with HyperliquidPublic(config=_fast_config(universe_cache_ttl_s=300.0)) as venue:
+        first: HLMeta = await venue.fetch_perp_universe("xyz")
+        second: HLMeta = await venue.fetch_perp_universe("xyz")
+
+    assert second is first
+    assert any(a.name == "xyz:XYZ100" for a in first.universe)
+    assert _universe_downloads(seen) == ["xyz"]
+
+
+async def test_perp_universe_refresh_downloads_again(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """refresh=True ignores a fresh saved copy and downloads."""
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(
+            perpdexs=load_json("perpdexs.json"),
+            meta_ctxs=load_json("meta_and_asset_ctxs_xyz.json"),
+            seen=seen,
+        )
+    )
+    async with HyperliquidPublic(config=_fast_config(universe_cache_ttl_s=300.0)) as venue:
+        await venue.fetch_perp_universe("xyz")
+        await venue.fetch_perp_universe("xyz", refresh=True)
+
+    assert _universe_downloads(seen) == ["xyz", "xyz"]
+
+
+async def test_perp_universe_expired_copy_is_downloaded_again(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """With a zero TTL every saved copy is already too old, so each call downloads."""
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(
+            perpdexs=load_json("perpdexs.json"),
+            meta_ctxs=load_json("meta_and_asset_ctxs.json"),
+            seen=seen,
+        )
+    )
+    async with HyperliquidPublic(config=_fast_config(universe_cache_ttl_s=0.0)) as venue:
+        await venue.fetch_perp_universe()
+        await venue.fetch_perp_universe()
+
+    assert _universe_downloads(seen) == ["", ""]
+
+
+async def test_perp_universe_is_saved_per_dex(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """Native and xyz lists are saved separately: each dex downloads once."""
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(
+            perpdexs=load_json("perpdexs.json"),
+            meta_ctxs=load_json("meta_and_asset_ctxs.json"),
+            seen=seen,
+        )
+    )
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        for dex in ["", "xyz", "", "xyz"]:
+            await venue.fetch_perp_universe(dex)
+
+    assert _universe_downloads(seen) == ["", "xyz"]
+
+
+async def test_perp_universe_concurrent_calls_download_once(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """Twenty simultaneous calls with nothing saved send exactly one download."""
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(
+            perpdexs=load_json("perpdexs.json"),
+            meta_ctxs=load_json("meta_and_asset_ctxs.json"),
+            seen=seen,
+        )
+    )
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        await asyncio.gather(*(venue.fetch_perp_universe() for _ in range(20)))
+
+    assert _universe_downloads(seen) == [""]
+
+
+async def test_perp_universe_unknown_dex_raises_before_network(
+    respx_mock: respx.MockRouter, load_json: Callable[[str], Any]
+) -> None:
+    """An unknown dex raises ValueError and nothing is downloaded or saved."""
+    seen: list[dict[str, Any]] = []
+    respx_mock.post(BASE_URL).mock(
+        side_effect=_dispatcher(perpdexs=load_json("perpdexs.json"), seen=seen)
+    )
+    async with HyperliquidPublic(config=_fast_config()) as venue:
+        with pytest.raises(ValueError, match="dex"):
+            await venue.fetch_perp_universe("does-not-exist")
+    assert _universe_downloads(seen) == []
 
 
 async def test_funding_history_pages_full_page_then_short(respx_mock: respx.MockRouter) -> None:
